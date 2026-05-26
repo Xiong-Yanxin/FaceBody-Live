@@ -54,13 +54,23 @@ class EmotiEffLibRecognizerOnnxGPU(EmotiEffLibRecognizerOnnx):
         graph.output.append(new_output)
 
         ort.set_default_logger_severity(3)
+        options = ort.SessionOptions()
+        options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+        options.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
+        options.intra_op_num_threads = 2
         self.ort_session = ort.InferenceSession(
             model.SerializeToString(), providers=_GPU_PROVIDERS,
+            sess_options=options,
         )
 
     def _init_custom(self, custom_onnx, custom_weights, custom_labels):
         ort.set_default_logger_severity(3)
-        self.ort_session = ort.InferenceSession(custom_onnx, providers=_GPU_PROVIDERS)
+        options = ort.SessionOptions()
+        options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+        options.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
+        options.intra_op_num_threads = 2
+        self.ort_session = ort.InferenceSession(custom_onnx, providers=_GPU_PROVIDERS,
+                                                 sess_options=options)
 
         data = np.load(custom_weights)
         self.classifier_weights = data["weights"]
