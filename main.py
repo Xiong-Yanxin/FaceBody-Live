@@ -17,7 +17,6 @@ from math import atan2, degrees, sqrt
 import threading
 from PIL import Image, ImageDraw, ImageFont
 import collections
-import scipy.signal as signal
 import queue
 
 
@@ -50,6 +49,162 @@ class EMASmoother:
             if self.lost_count > self.max_lost_frames:
                 self.smoothed = None
             return self.smoothed
+
+
+def _get_or_create_smoother(pool, person_id, alpha, max_lost):
+    """按 person_id 获取或创建 EMA 平滑器"""
+    if person_id not in pool:
+        pool[person_id] = EMASmoother(alpha=alpha, max_lost_frames=max_lost)
+    return pool[person_id]
+
+
+# 根据人脸位置分配人员ID
+_PERSON_COLORS_BGR = [
+    (0, 0, 255),    # 红 - person 0 (主人物，最大人脸)
+    (255, 0, 0),    # 蓝 - person 1
+    (0, 255, 255),  # 黄 - person 2
+    (255, 0, 255),  # 品红 - person 3
+]
+_MAX_PEOPLE = 4
+_MAX_CENTROID_DIST = 0.15  # 一帧最多漂这么远，超过就算不同人了
+
+
+def assign_person_ids(face_list, pose_list, prev_face_centroids, fw, fh):
+    """为检测到的人脸和姿态分配持久化 person ID。
+    返回 (person_faces, person_poses, new_centroids, unmatched_poses)
+
+    person_faces: dict[pid] = (face_lms, bbox_px, centroid, area, orig_idx)
+    person_poses: dict[pid] = pose_lms or None
+    unmatched_poses: list of pose_lms not matched to any face
+    """
+    if not face_list:
+        # 人脸被遮挡时，用姿态鼻子位置维持 person ID
+        if not pose_list or not prev_face_centroids:
+            return {}, {}, {}, list(pose_list) if pose_list else []
+        person_poses = {}
+        new_centroids = {}
+        used_poses = set()
+        max_dist_sq = _MAX_CENTROID_DIST ** 2
+        for prev_id in sorted(prev_face_centroids.keys()):
+            px, py = prev_face_centroids[prev_id]
+            best_dist = float("inf")
+            best_idx = -1
+            for pi, pose_lms in enumerate(pose_list):
+                if pi in used_poses:
+                    continue
+                nose = pose_lms[0]
+                dist = (nose.x - px) ** 2 + (nose.y - py) ** 2
+                if dist < best_dist and dist < max_dist_sq:
+                    best_dist = dist
+                    best_idx = pi
+            if best_idx >= 0:
+                person_poses[prev_id] = pose_list[best_idx]
+                nose = pose_list[best_idx][0]
+                new_centroids[prev_id] = (nose.x, nose.y)
+                used_poses.add(best_idx)
+        unmatched = [pl for pi, pl in enumerate(pose_list) if pi not in used_poses]
+        return {}, person_poses, new_centroids, unmatched
+
+    # Step 1: 计算每张人脸 bbox + 质心 + 面积
+    face_entries = []
+    for idx, face_lms in enumerate(face_list):
+        xs = [lm.x for lm in face_lms]
+        ys = [lm.y for lm in face_lms]
+        x_min, x_max = min(xs), max(xs)
+        y_min, y_max = min(ys), max(ys)
+        bw, bh = x_max - x_min, y_max - y_min
+        if bw <= 0 or bh <= 0:
+            continue
+        margin = 0.35
+        x_min_m = max(0.0, x_min - bw * margin)
+        x_max_m = min(1.0, x_max + bw * margin)
+        y_min_m = max(0.0, y_min - bh * margin)
+        y_max_m = min(1.0, y_max + bh * margin)
+        cx = (x_min_m + x_max_m) / 2.0
+        cy = (y_min_m + y_max_m) / 2.0
+        area = (x_max_m - x_min_m) * (y_max_m - y_min_m)
+        bbox_px = (int(x_min_m * fw), int(y_min_m * fh),
+                   int((x_max_m - x_min_m) * fw), int((y_max_m - y_min_m) * fh))
+        face_entries.append((face_lms, bbox_px, (cx, cy), area, idx))
+
+    if not face_entries:
+        return {}, {}, {}, list(pose_list) if pose_list else []
+
+    # Step 2: 按面积降序 → person 0 = 最大人脸
+    face_entries.sort(key=lambda e: e[3], reverse=True)
+    if len(face_entries) > _MAX_PEOPLE:
+        face_entries = face_entries[:_MAX_PEOPLE]
+
+    # Step 3: 质心最近邻匹配，跨帧保持 ID
+    person_faces = {}
+    new_centroids = {}
+    used_cur = set()
+    max_dist_sq = _MAX_CENTROID_DIST ** 2
+
+    if prev_face_centroids:
+        current_centroids = [e[2] for e in face_entries]
+        for prev_id in sorted(prev_face_centroids.keys()):
+            best_dist = float("inf")
+            best_idx = -1
+            for i, cur_cent in enumerate(current_centroids):
+                if i in used_cur:
+                    continue
+                dist = (cur_cent[0] - prev_face_centroids[prev_id][0]) ** 2 + \
+                       (cur_cent[1] - prev_face_centroids[prev_id][1]) ** 2
+                if dist < best_dist and dist < max_dist_sq:
+                    best_dist = dist
+                    best_idx = i
+            if best_idx >= 0:
+                person_faces[prev_id] = face_entries[best_idx]
+                new_centroids[prev_id] = face_entries[best_idx][2]
+                used_cur.add(best_idx)
+    else:
+        # 首帧：直接按顺序分配 ID
+        for i, entry in enumerate(face_entries):
+            person_faces[i] = entry
+            new_centroids[i] = entry[2]
+            used_cur.add(i)
+
+    # 为新出现的人脸分配新 ID
+    next_id = 0
+    for i in range(len(face_entries)):
+        if i in used_cur:
+            continue
+        while next_id in person_faces:
+            next_id += 1
+        if next_id >= _MAX_PEOPLE:
+            break
+        person_faces[next_id] = face_entries[i]
+        new_centroids[next_id] = face_entries[i][2]
+        used_cur.add(i)
+        next_id += 1
+
+    # Step 4: 姿态关联 — 鼻子落点在人脸 bbox 内即匹配
+    person_poses = {}
+    used_pose_indices = set()
+    for pid, (_, bbox_px, _, _, _) in person_faces.items():
+        fx_n = bbox_px[0] / fw
+        fy_n = bbox_px[1] / fh
+        fw_n = bbox_px[2] / fw
+        fh_n = bbox_px[3] / fh
+        matched = False
+        for pi, pose_lms in enumerate(pose_list or []):
+            if pi in used_pose_indices:
+                continue
+            nose = pose_lms[0]
+            if fx_n <= nose.x <= fx_n + fw_n and fy_n <= nose.y <= fy_n + fh_n:
+                person_poses[pid] = pose_lms
+                used_pose_indices.add(pi)
+                matched = True
+                break
+        if not matched:
+            person_poses[pid] = None
+
+    # 收集未匹配的姿态
+    unmatched_poses = [pl for pi, pl in enumerate(pose_list or [])
+                       if pi not in used_pose_indices]
+
+    return person_faces, person_poses, new_centroids, unmatched_poses
 
 
 # 每种情绪对应的显示颜色 (BGR)
@@ -97,8 +252,8 @@ def classify_emotion(blendshapes):
     best = max(scores, key=scores.get)
     best_score = scores[best]
     if best_score < 0.35:  # 分数太低就默认 Neutral
-        return "Neutral", best_score
-    return best, best_score
+        return "Neutral", best_score, s
+    return best, best_score, s
 
 
 # 情绪 + 手势 → 意图映射 (7x10 = 70 条)
@@ -192,14 +347,21 @@ _INTENT_MAP = {
 _DISSONANCE_TAG = "[失调警报]"
 
 
+# scipy 导入耗时较长，提前到模块层导入避免运行时卡顿
+try:
+    import scipy.signal as _scipy_signal
+except ImportError:
+    _scipy_signal = None
+
+
 def estimate_heart_rate(rppg_buffer, fps):
-    if len(rppg_buffer) < 120:
+    if _scipy_signal is None or len(rppg_buffer) < 120:
         return None
     g = np.array(rppg_buffer, dtype=np.float64)
     g -= g.mean()
     try:
-        sos = signal.butter(4, [0.75, 2.5], btype="band", fs=fps, output="sos")
-        g = signal.sosfiltfilt(sos, g)
+        sos = _scipy_signal.butter(4, [0.75, 2.5], btype="band", fs=fps, output="sos")
+        g = _scipy_signal.sosfiltfilt(sos, g)
     except Exception:
         return None
     n = len(g)
@@ -259,12 +421,16 @@ def _bgr_to_rgba(bgr, alpha=255):
 def draw_modern_hud_panel(draw, text, x, y, font,
                           text_color=(255, 255, 255, 255),
                           bg_color=(30, 30, 30, 180),
-                          radius=12, pad_x=15, pad_y=10):
-    """画一个圆角矩形 HUD 卡片，文字居中"""
+                          radius=12, pad_x=15, pad_y=10,
+                          accent_color=None, card_width=None):
+    """画一个圆角矩形 HUD 卡片，文字居中；可选 accent 装饰条；card_width 可统一宽度"""
     bbox = draw.textbbox((0, 0), text, font=font)
     tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
-    rw, rh = tw + pad_x * 2, th + pad_y * 2
+    rw = max(tw + pad_x * 2, card_width) if card_width else tw + pad_x * 2
+    rh = th + pad_y * 2
     draw.rounded_rectangle([x, y, x + rw, y + rh], radius=radius, fill=bg_color)
+    if accent_color is not None:
+        draw.rounded_rectangle([x + 6, y + 2, x + rw - 6, y + 5], radius=2, fill=accent_color)
     tx = x + (rw - tw) // 2
     ty = y + (rh - th) // 2 - bbox[1]
     draw.text((tx, ty), text, font=font, fill=text_color)
@@ -313,20 +479,23 @@ def _wrap_text_lines(draw, text, font, max_px):
 
 def draw_pil_notification_card(draw, text, center_x, top_y, font,
                                is_high_alert=None, bounds=None):
-    """画通知卡片，警告用红色、普通用青色，支持2行 + 边界限制"""
+    """画通知卡片，警告用红色、普通用青色，支持2行 + 边界限制 + 左侧彩色装饰条"""
     if is_high_alert is None:
         is_high_alert = _is_high_alert(text)
     is_alert = is_high_alert
     if is_alert:
         bg = (180, 0, 20, 220)
         fg = (255, 255, 255, 255)
+        accent = (255, 60, 60, 255)
         radius = 16
     else:
         bg = (10, 40, 50, 200)
         fg = (0, 255, 255, 255)
+        accent = (0, 220, 220, 255)
         radius = 12
     pad_x, pad_y = 18, 14
     line_gap = 4
+    left_bar_w = 4
 
     if bounds is not None:
         max_tw = (bounds[1] - bounds[0]) - pad_x * 2 - 8
@@ -346,6 +515,10 @@ def draw_pil_notification_card(draw, text, center_x, top_y, font,
         x_min, x_max = bounds
         rx = max(x_min + 4, min(rx, x_max - rw - 4))
     draw.rounded_rectangle([rx, top_y, rx + rw, top_y + rh], radius=radius, fill=bg)
+    # 左侧彩色装饰条
+    draw.rounded_rectangle(
+        [rx + 2, top_y + 4, rx + 2 + left_bar_w, top_y + rh - 4],
+        radius=left_bar_w // 2, fill=accent)
     # 每行居中绘制
     cur_y = top_y + (rh - total_th) // 2
     for ln in lines:
@@ -391,7 +564,7 @@ def draw_pil_text_card(draw, text, center_x, top_y, font,
 
 def draw_pil_emotion_bars(draw, x, y, w, bar_h, gap,
                           scores_array, label_order, font_small):
-    """画情绪置信度圆角条形图"""
+    """画情绪置信度圆角条形图（渐变填充 + 百分比 + 描边）"""
     for i, name in enumerate(label_order):
         val = float(scores_array[i]) if i < len(scores_array) else 0.0
         by_ = y + i * (bar_h + gap)
@@ -399,18 +572,36 @@ def draw_pil_emotion_bars(draw, x, y, w, bar_h, gap,
         draw.rounded_rectangle([x, by_, x + w, by_ + bar_h], radius=4,
                                fill=(0, 0, 0, 100))
         if val > 0.001:
-            bw = int(w * min(val, 1.0))
-            if bw > 4:
-                color_bgr = _EMOTION_COLORS_8.get(name, (180, 180, 180))
-                color_rgba = (int(color_bgr[2]), int(color_bgr[1]),
-                              int(color_bgr[0]), 220)
-                draw.rounded_rectangle([x, by_, x + bw, by_ + bar_h],
-                                       radius=4, fill=color_rgba)
+            bw = max(4, int(w * min(val, 1.0)))
+            color_bgr = _EMOTION_COLORS_8.get(name, (180, 180, 180))
+            r_c, g_c, b_c = int(color_bgr[2]), int(color_bgr[1]), int(color_bgr[0])
+            # 用numpy画渐变条，8段就够了，别逐像素画
+            segments = 8
+            for seg in range(segments):
+                t = (seg + 0.5) / segments
+                sx = x + int(bw * seg / segments)
+                ex = x + int(bw * (seg + 1) / segments)
+                if ex <= sx:
+                    continue
+                fill_r = int(r_c * (0.45 + 0.55 * t))
+                fill_g = int(g_c * (0.45 + 0.55 * t))
+                fill_b = int(b_c * (0.45 + 0.55 * t))
+                draw.rectangle([sx, by_ + 1, ex, by_ + bar_h - 1],
+                               fill=(fill_r, fill_g, fill_b, 230))
+            # 1px 描边
+            draw.rounded_rectangle([x, by_, x + bw, by_ + bar_h], radius=4,
+                                   outline=(r_c, g_c, b_c, 180), width=1)
+        # 情绪名
         draw.text((x + 5, by_ + 1), name, font=font_small,
-                  fill=(255, 255, 255, 200))
+                  fill=(255, 255, 255, 210))
+        # 右侧百分比
+        pct_text = f"{val:.0%}"
+        pct_tw = draw.textbbox((0, 0), pct_text, font=font_small)[2]
+        draw.text((x + w - pct_tw - 4, by_ + 1), pct_text, font=font_small,
+                  fill=(220, 220, 220, 200))
 
 
-# 在 PIL draw 上画带背景的中文文字（向后兼容旧代码）
+# 用PIL画中文，带个背景框，老代码也要能用
 def draw_chinese_text_on_draw(draw, text, center_x, top_y, font,
                               text_color=(0, 255, 255), bg_color=(0, 0, 0)):
     bbox = draw.textbbox((0, 0), text, font=font)
@@ -433,7 +624,7 @@ _UPPER_BODY_IDS = frozenset({
 })
 _WRIST_IDS = (15, 16)  # 左右手腕
 
-# 深度无关阈值（已用肩宽归一化）
+# 阈值已经用肩膀宽度归一化了，远近都能用
 _T_STIFF = 0.0125     # 上半身总动能低于此 → 僵直
 _T_MICRO = 0.075      # 手部动能高于此 → 微颤
 _T_ACCEL = 0.04       # 手腕加速度高于此 → 爆发
@@ -459,19 +650,19 @@ def analyze_cognitive_and_anticipation(pose_history, emotion):
     if ref_length < 0.05:
         ref_length = 0.4  # 遮挡或太远时用保底值
 
-    # 速度和加速度（逐关节）
+    # 每个关节的速度和加速度
     v_t = xyz2 - xyz1
     v_t1 = xyz1 - xyz0
     a_t = v_t - v_t1
     speed_t = np.linalg.norm(v_t, axis=1)
     accel_t = np.linalg.norm(a_t, axis=1)
 
-    # 上半身总动能（深度归一化）
+    # 上半身总动能，深度已经归一化了
     upper_mask = np.array([i in _UPPER_BODY_IDS for i in range(33)])
     upper_speed2 = speed_t[upper_mask] ** 2
     ek_total = float(np.sum(upper_speed2)) / (ref_length ** 2)
 
-    # 手部指标（深度归一化）
+    # 手的指标，深度也归一化了
     hand_mask = np.array([i in _WRIST_IDS for i in range(33)])
     ek_hands = float(np.sum(speed_t[hand_mask] ** 2)) / (ref_length ** 2)
     wrist_accel = (np.max(accel_t[hand_mask]) if np.any(hand_mask) else 0.0) / ref_length
@@ -504,62 +695,125 @@ def analyze_cognitive_and_anticipation(pose_history, emotion):
     return None
 
 
-# 注视-手指拓扑 + 微表情泄漏检测
-_MICRO_KEYS = {
-    "noseSneerLeft":   "瞬时厌恶抽动 (Disgust leak)",
-    "noseSneerRight":  "瞬时厌恶抽动 (Disgust leak)",
-    "mouthDimpleLeft":  "瞬时讥笑抽动 (Smirk leak)",
-    "mouthDimpleRight": "瞬时讥笑抽动 (Smirk leak)",
-    "browInnerUp":     "瞬时悲伤/恐惧抽动 (Sadness/Fear leak)",
+# blendshape的中文名字，显示在脸旁边
+_BS_CN_LABELS = {
+    "browInnerUp":         "挑眉",
+    "browDownLeft":        "左皱眉",
+    "browDownRight":       "右皱眉",
+    "browOuterUpLeft":     "左抬眉",
+    "browOuterUpRight":    "右抬眉",
+    "eyeBlinkLeft":        "左眨眼",
+    "eyeBlinkRight":       "右眨眼",
+    "eyeSquintLeft":       "左眯眼",
+    "eyeSquintRight":      "右眯眼",
+    "eyeWideLeft":         "左瞪眼",
+    "eyeWideRight":        "右瞪眼",
+    "mouthSmileLeft":      "左微笑",
+    "mouthSmileRight":     "右微笑",
+    "mouthFrownLeft":      "左撇嘴",
+    "mouthFrownRight":     "右撇嘴",
+    "mouthDimpleLeft":     "左酒窝",
+    "mouthDimpleRight":    "右酒窝",
+    "mouthUpperUpLeft":    "左上唇扬",
+    "mouthUpperUpRight":   "右上唇扬",
+    "mouthPressLeft":      "左抿嘴",
+    "mouthPressRight":     "右抿嘴",
+    "noseSneerLeft":       "左鼻翼",
+    "noseSneerRight":      "右鼻翼",
+    "jawOpen":             "张嘴",
+    "mouthPucker":         "噘嘴",
+    "cheekSquintLeft":     "左脸颊",
+    "cheekSquintRight":    "右脸颊",
+}
+
+# 左右对称的动作，取大的那个显示就行
+_BS_MERGED = {
+    "browDown":       ("browDownLeft", "browDownRight"),
+    "browOuterUp":    ("browOuterUpLeft", "browOuterUpRight"),
+    "eyeBlink":       ("eyeBlinkLeft", "eyeBlinkRight"),
+    "eyeSquint":      ("eyeSquintLeft", "eyeSquintRight"),
+    "eyeWide":        ("eyeWideLeft", "eyeWideRight"),
+    "mouthSmile":     ("mouthSmileLeft", "mouthSmileRight"),
+    "mouthFrown":     ("mouthFrownLeft", "mouthFrownRight"),
+    "mouthDimple":    ("mouthDimpleLeft", "mouthDimpleRight"),
+    "mouthUpperUp":   ("mouthUpperUpLeft", "mouthUpperUpRight"),
+    "mouthPress":     ("mouthPressLeft", "mouthPressRight"),
+    "noseSneer":      ("noseSneerLeft", "noseSneerRight"),
+    "cheekSquint":    ("cheekSquintLeft", "cheekSquintRight"),
+}
+_BS_MERGED_LABELS = {
+    "browDown":       "皱眉",
+    "browOuterUp":    "抬眉",
+    "eyeBlink":       "眨眼",
+    "eyeSquint":      "眯眼",
+    "eyeWide":        "瞪眼",
+    "mouthSmile":     "微笑",
+    "mouthFrown":     "撇嘴",
+    "mouthDimple":    "酒窝",
+    "mouthUpperUp":   "上唇扬",
+    "mouthPress":     "抿嘴",
+    "noseSneer":      "鼻翼抽动",
+    "cheekSquint":    "脸颊收紧",
 }
 
 
+def get_facial_actions(blendshapes, top_n=4, min_score=0.06):
+    """从 blendshape 列表中提取最显著的几个面部动作，返回 [(中文名, 百分比), ...]"""
+    if blendshapes is None:
+        return []
+    s = {bs.category_name: bs.score for bs in blendshapes}
+
+    results = []
+    # 先处理独立动作
+    for key, cn_name in _BS_CN_LABELS.items():
+        if key in s and s[key] > min_score:
+            results.append((cn_name, s[key]))
+
+    # 合并左右对称的，取大的
+    for merged, (left, right) in _BS_MERGED.items():
+        val = max(s.get(left, 0.0), s.get(right, 0.0))
+        if val > min_score:
+            # 去掉左右单独条目，用合并条目代替
+            left_name = _BS_CN_LABELS.get(left, "")
+            right_name = _BS_CN_LABELS.get(right, "")
+            results = [(n, v) for n, v in results
+                       if n != left_name and n != right_name]
+            results.append((_BS_MERGED_LABELS[merged], val))
+
+    # 按强度降序
+    results.sort(key=lambda x: x[1], reverse=True)
+    return results[:top_n]
+
+
 def advanced_cognitive_engine(hand_landmarks, head_pose_angles,
-                              current_bs, micro_bs_history,
-                              current_emotion, current_gesture):
-    """注视方向 vs 手指方向的3D夹角 + 微表情微分泄漏。返回 (警告文字, BGR颜色) 或 None"""
-    alerts = []
-
-    # 逻辑1: 注视-手指3D夹角
-    if (head_pose_angles is not None and hand_landmarks is not None
+                              current_gesture):
+    """注视方向 vs 手指方向3D夹角检测。返回 (警告文字, BGR颜色) 或 None"""
+    if not (head_pose_angles is not None and hand_landmarks is not None
             and current_gesture == "Pointing_Up"):
-        pitch, yaw, _roll = head_pose_angles
-        rad = np.deg2rad
-        cp, sp = np.cos(rad(pitch)), np.sin(rad(pitch))
-        cy, sy = np.cos(rad(yaw)), np.sin(rad(yaw))
-        vec_gaze = np.array([-sy * cp, sp, -cy * cp], dtype=np.float64)
-        vec_gaze /= np.linalg.norm(vec_gaze) + 1e-8
+        return None
 
-        # 以头部为原点，计算食指指尖方向
-        for hand_lms in hand_landmarks:
-            idx_tip = np.array([hand_lms[8].x, hand_lms[8].y,
-                                hand_lms[8].z], dtype=np.float64)
-            norm = np.linalg.norm(idx_tip)
-            if norm < 1e-8:
-                continue
-            vec_finger = idx_tip / norm
-            cos_angle = np.dot(vec_gaze, vec_finger)
-            cos_angle = max(-1.0, min(1.0, cos_angle))
-            angle_deg = degrees(np.arccos(cos_angle))
-            if angle_deg > 35:
-                alerts.append((
-                    "[交互异常] 盲指 / 认知游离 (Blind Pointing / Distracted)",
-                    (0, 0, 200),
-                ))
-                break
+    pitch, yaw, _roll = head_pose_angles
+    rad = np.deg2rad
+    cp, sp = np.cos(rad(pitch)), np.sin(rad(pitch))
+    cy, sy = np.cos(rad(yaw)), np.sin(rad(yaw))
+    vec_gaze = np.array([-sy * cp, sp, -cy * cp], dtype=np.float64)
+    vec_gaze /= np.linalg.norm(vec_gaze) + 1e-8
 
-    # 逻辑2: 微表情瞬时微分（中性表情下检测泄漏）
-    if current_bs is not None:
-        micro_bs_history.append(dict(current_bs))
-        if len(micro_bs_history) >= 3 and current_emotion == "Neutral":
-            bs0 = micro_bs_history[0]
-            for key, label in _MICRO_KEYS.items():
-                delta = abs(current_bs.get(key, 0.0) - bs0.get(key, 0.0))
-                if delta > 0.12:
-                    alerts.append((f"[微表情泄露] {label}", (150, 0, 150)))
-                    break
+    for hand_lms in hand_landmarks:
+        idx_tip = np.array([hand_lms[8].x, hand_lms[8].y,
+                            hand_lms[8].z], dtype=np.float64)
+        norm = np.linalg.norm(idx_tip)
+        if norm < 1e-8:
+            continue
+        vec_finger = idx_tip / norm
+        cos_angle = np.dot(vec_gaze, vec_finger)
+        cos_angle = max(-1.0, min(1.0, cos_angle))
+        angle_deg = degrees(np.arccos(cos_angle))
+        if angle_deg > 35:
+            return ("[交互异常] 盲指 / 认知游离 (Blind Pointing / Distracted)",
+                    (0, 0, 200))
 
-    return alerts[0] if alerts else None
+    return None
 
 
 # 从人脸关键点算包围盒
@@ -579,7 +833,7 @@ def get_face_bbox(face_landmarks, frame_w, frame_h, margin=0.35):
             int((x_max - x_min) * frame_w), int((y_max - y_min) * frame_h))
 
 
-# 画置信度进度条（cv2版本，用于向后兼容）
+# 画个进度条显示置信度
 def draw_progress_bar(img, x, y, w, h, value, color, label=""):
     cv2.rectangle(img, (x, y), (x + w, y + h), (60, 60, 60), -1)
     bar_w = int(w * min(value, 1.0))
@@ -621,6 +875,20 @@ _CONTOUR_MAP = {
     "LIPS":     [FaceLandmarksConnections.FACE_LANDMARKS_LIPS],
 }
 
+# blendshape key → 面部区域映射
+_BS_REGION = {}
+for _k in ["browInnerUp", "browDownLeft", "browDownRight",
+           "browOuterUpLeft", "browOuterUpRight"]:
+    _BS_REGION[_k] = "EYEBROWS"
+for _k in ["eyeBlinkLeft", "eyeBlinkRight", "eyeSquintLeft", "eyeSquintRight",
+           "eyeWideLeft", "eyeWideRight"]:
+    _BS_REGION[_k] = "EYES"
+for _k in ["mouthSmileLeft", "mouthSmileRight", "mouthFrownLeft", "mouthFrownRight",
+           "mouthDimpleLeft", "mouthDimpleRight", "mouthUpperUpLeft", "mouthUpperUpRight",
+           "mouthPressLeft", "mouthPressRight", "jawOpen", "mouthPucker",
+           "noseSneerLeft", "noseSneerRight"]:
+    _BS_REGION[_k] = "LIPS"
+
 
 def draw_emotion_focus(img, landmark_list, emotion):
     """高亮当前情绪相关的面部区域"""
@@ -636,7 +904,46 @@ def draw_emotion_focus(img, landmark_list, emotion):
                 landmark_drawing_spec=nodot, connection_drawing_spec=red)
 
 
-# 画全身33个姿态关键点 + 连线（支持 ST-GCN 注意力热力图）
+def draw_action_glow(img, landmark_list, blendshapes, min_score=0.06):
+    """将当前活跃的面部动作部位用红色渐变标注"""
+    if blendshapes is None:
+        return
+    s = {bs.category_name: bs.score for bs in blendshapes}
+    active_regions = set()
+    for bs_key, region in _BS_REGION.items():
+        val = s.get(bs_key, 0)
+        # 也检查合并键
+        for merged, (left, right) in _BS_MERGED.items():
+            if bs_key in (left, right):
+                val = max(val, s.get(left, 0), s.get(right, 0))
+                break
+        if val > min_score:
+            active_regions.add(region)
+
+    if not active_regions:
+        return
+
+    overlay = np.zeros_like(img)
+    nodot = drawing_utils.DrawingSpec(color=(0, 0, 0), thickness=0, circle_radius=0)
+    # 三层渐变：外圈粗淡 → 内圈细浓
+    layers = [
+        (30, 20, 80, 4),    # 淡粉粗线 (BGR)
+        (30, 20, 110, 2),   # 中粉
+        (30, 20, 150, 1),   # 亮粉细线
+    ]
+    for b, g, r, t in layers:
+        spec = drawing_utils.DrawingSpec(color=(b, g, r), thickness=t, circle_radius=0)
+        for region in active_regions:
+            for conn_list in _CONTOUR_MAP.get(region, []):
+                drawing_utils.draw_landmarks(
+                    image=overlay, landmark_list=landmark_list, connections=conn_list,
+                    landmark_drawing_spec=nodot, connection_drawing_spec=spec)
+
+    overlay = cv2.GaussianBlur(overlay, (5, 5), 2)
+    cv2.addWeighted(overlay, 0.28, img, 1.0, 0, dst=img)
+
+
+# 画全身33个关键点和连线
 def draw_pose_full(img, landmarks, w, h,
                    lm_color=(0, 255, 0), cn_color=(0, 0, 255),
                    thickness=2, circle_r=3, skip_face=False,
@@ -695,7 +1002,7 @@ def draw_pose_full(img, landmarks, w, h,
             cv2.line(img, pts[a], pts[b], cn_color, thickness)
 
 
-# 头部姿态估计（solvePnP）
+# 用solvePnP估个头的角度
 # 通用3D人脸模型点
 _FACE_3D_POINTS = np.array([
     [0.0, 0.0, 0.0],       # 1    nose tip
@@ -763,7 +1070,7 @@ def draw_head_pose_axes(img, img_pts, pose_angles, size=40):
 #       Victory, ILoveYou, 或 None
 
 
-# 三点算角度（b 是顶点），返回度数
+# 三个点算夹角，b是顶点，返回角度
 def calc_angle(a, b, c):
     ba = (a[0] - b[0], a[1] - b[1])
     bc = (c[0] - b[0], c[1] - b[1])
@@ -787,16 +1094,22 @@ def is_middle_finger_extended(landmarks):
     return middle_extended and others_curled
 
 
-# 手指比心：拇指和食指尖距离阈值（归一化坐标）
+# 比心手势：拇指和食指尖距离多近才算比心了
 _FINGER_HEART_TOUCH_THRESHOLD = 0.10
 
 
 def is_finger_heart(landmarks):
-    """单手比心: 拇指尖(4)和食指尖(8)接触，其他三指弯曲"""
+    """单手比心: 拇指尖(4)和食指尖(8)接触，拇指和食指伸展，其他三指弯曲"""
     thumb = np.array([landmarks[4].x, landmarks[4].y, landmarks[4].z])
     index = np.array([landmarks[8].x, landmarks[8].y, landmarks[8].z])
     if np.linalg.norm(thumb - index) >= _FINGER_HEART_TOUCH_THRESHOLD:
         return False
+    # 拇指和食指得伸着，不能是握拳状态
+    thumb_extended = landmarks[4].y < landmarks[3].y  # tip above IP joint
+    index_extended = landmarks[8].y < landmarks[6].y  # tip above PIP joint
+    if not (thumb_extended and index_extended):
+        return False
+    # 其他三指弯曲
     return (landmarks[12].y > landmarks[10].y and
             landmarks[16].y > landmarks[14].y and
             landmarks[20].y > landmarks[18].y)
@@ -857,13 +1170,13 @@ def draw_joint_angles(img, landmarks, w, h):
 
 
 # 块置乱加密可视化: 8x8 分块随机打乱
-_SCRAMBLE_RNG = np.random.RandomState(42)
+_SCRAMBLE_RNG = np.random.default_rng(42)
 _SCRAMBLE_ORDER = None
 _SCRAMBLE_FRAME_SHAPE = None
 
 
 def _get_scramble_order(h, w, grid=8):
-    """生成块级置乱映射，按帧尺寸缓存"""
+    """生成块级置乱映射，按帧尺寸缓存（向量化版本）"""
     global _SCRAMBLE_ORDER, _SCRAMBLE_FRAME_SHAPE
     if _SCRAMBLE_FRAME_SHAPE == (h, w) and _SCRAMBLE_ORDER is not None:
         return _SCRAMBLE_ORDER
@@ -871,16 +1184,23 @@ def _get_scramble_order(h, w, grid=8):
     block_indices = [(i, j) for i in range(grid) for j in range(grid)]
     shuffled = block_indices[:]
     _SCRAMBLE_RNG.shuffle(shuffled)
-    # 构建像素级索引映射
-    new_to_old = np.empty((h, w, 2), dtype=np.int32)
+    # 构建块级源映射: dst_block → src_block
+    src_block_y = np.empty((grid, grid), dtype=np.int32)
+    src_block_x = np.empty((grid, grid), dtype=np.int32)
     for old_idx, (oi, oj) in enumerate(block_indices):
         ni, nj = shuffled[old_idx]
-        y0_dst, x0_dst = ni * bh, nj * bw
-        y0_src, x0_src = oi * bh, oj * bw
-        for dy in range(bh):
-            for dx in range(bw):
-                new_to_old[y0_dst + dy, x0_dst + dx] = [y0_src + dy, x0_src + dx]
-    _SCRAMBLE_ORDER = new_to_old
+        src_block_y[ni, nj] = oi
+        src_block_x[ni, nj] = oj
+    # 用广播生成像素级映射，避免 O(H*W) 循环
+    dy_idx = np.arange(h, dtype=np.int32)
+    dx_idx = np.arange(w, dtype=np.int32)
+    block_y_idx = np.clip(dy_idx // bh, 0, grid - 1)
+    block_x_idx = np.clip(dx_idx // bw, 0, grid - 1)
+    src_bky = src_block_y[block_y_idx[:, None], block_x_idx[None, :]]
+    src_bkx = src_block_x[block_y_idx[:, None], block_x_idx[None, :]]
+    src_y = src_bky * bh + (dy_idx[:, None] % bh)
+    src_x = src_bkx * bw + (dx_idx[None, :] % bw)
+    _SCRAMBLE_ORDER = np.stack([src_y, src_x], axis=-1)
     _SCRAMBLE_FRAME_SHAPE = (h, w)
     return _SCRAMBLE_ORDER
 
@@ -896,6 +1216,36 @@ def apply_scramble(frame):
     src_x = idx[:, :, 1]
     scrambled[dst_y, dst_x] = frame[src_y, src_x]
     return scrambled
+
+
+def avg2(s, k1, k2):
+    """取两个blendshape分数的均值"""
+    return (s.get(k1, 0) + s.get(k2, 0)) / 2
+
+
+def _draw_sidebar_alert_block(pil_draw, text, font, max_px, sx, sw, sy,
+                                bg_fill, text_fill):
+    """侧边栏告警卡片: 返回更新后的 sy 坐标"""
+    lines = _wrap_text_lines(pil_draw, text, font, max_px)
+    lh = pil_draw.textbbox((0, 0), "Ag", font=font)[3]
+    row_h = lh * len(lines) + 2 * (len(lines) - 1) + 10
+    pil_draw.rounded_rectangle([sx + 8, sy, sx + sw - 8, sy + row_h],
+                                radius=6, fill=bg_fill)
+    cy = sy + (row_h - lh * len(lines)) // 2
+    for ln in lines:
+        pil_draw.text((sx + 14, cy), ln, font=font, fill=text_fill)
+        cy += lh + 2
+    return sy + row_h + 4
+
+
+def _draw_section_divider(draw, text, at_y, font, sx, sw):
+    """侧边栏分组标题：文字居中，两侧细线"""
+    tw_s = draw.textbbox((0, 0), text, font=font)[2]
+    lx = sx + (sw - tw_s) // 2
+    bar_y = at_y + 7
+    draw.line([(sx + 18, bar_y), (lx - 6, bar_y)], fill=(100, 100, 120, 120), width=1)
+    draw.line([(lx + tw_s + 6, bar_y), (sx + sw - 18, bar_y)], fill=(100, 100, 120, 120), width=1)
+    draw.text((lx, at_y), text, font=font, fill=(160, 160, 180, 200))
 
 
 # ==================== 主程序 ====================
@@ -933,11 +1283,11 @@ def main():
         nonlocal face_result
         face_result = result
 
-    # 初始化三个检测器（异步回调模式）
+    # 初始化三个检测器，都是异步回调的
     pose_landmarker = PoseLandmarker.create_from_options(PoseLandmarkerOptions(
         base_options=BaseOptions(model_asset_path=pose_model),
         running_mode=RunningMode.LIVE_STREAM,
-        num_poses=1,
+        num_poses=4,
         min_pose_detection_confidence=0.4,
         min_pose_presence_confidence=0.4,
         min_tracking_confidence=0.4,
@@ -947,15 +1297,15 @@ def main():
         base_options=BaseOptions(model_asset_path=gesture_model),
         running_mode=RunningMode.LIVE_STREAM,
         num_hands=2,
-        min_hand_detection_confidence=0.4,
-        min_hand_presence_confidence=0.4,
+        min_hand_detection_confidence=0.35,
+        min_hand_presence_confidence=0.35,
         min_tracking_confidence=0.4,
         result_callback=on_gesture_result,
     ))
     face_landmarker = FaceLandmarker.create_from_options(FaceLandmarkerOptions(
         base_options=BaseOptions(model_asset_path=face_model),
         running_mode=RunningMode.LIVE_STREAM,
-        num_faces=1,
+        num_faces=4,
         min_face_detection_confidence=0.4,
         min_face_presence_confidence=0.4,
         min_tracking_confidence=0.4,
@@ -981,15 +1331,16 @@ def main():
     EMOTION_LABELS = [EMOTION_IDX[i] for i in sorted(EMOTION_IDX.keys())]
 
     # 绘图样式
-    left_lm = drawing_utils.DrawingSpec(color=(0, 255, 255), thickness=2, circle_radius=2)
-    left_cn = drawing_utils.DrawingSpec(color=(0, 140, 255), thickness=2, circle_radius=1)
-    right_lm = drawing_utils.DrawingSpec(color=(255, 0, 255), thickness=2, circle_radius=2)
-    right_cn = drawing_utils.DrawingSpec(color=(255, 0, 140), thickness=2, circle_radius=1)
-    face_tess = drawing_utils.DrawingSpec(color=(220, 215, 235), thickness=1, circle_radius=1)
+    left_lm = drawing_utils.DrawingSpec(color=(0, 255, 255), thickness=3, circle_radius=3)
+    left_cn = drawing_utils.DrawingSpec(color=(0, 140, 255), thickness=3, circle_radius=2)
+    right_lm = drawing_utils.DrawingSpec(color=(255, 0, 255), thickness=3, circle_radius=3)
+    right_cn = drawing_utils.DrawingSpec(color=(255, 0, 140), thickness=3, circle_radius=2)
+    face_tess = drawing_utils.DrawingSpec(color=(180, 210, 220), thickness=1, circle_radius=1)
 
-    # EMA 平滑器
-    pose_smoother = EMASmoother(alpha=0.5, max_lost_frames=25)
-    face_smoother = EMASmoother(alpha=0.5, max_lost_frames=15)
+    # 每个人单独一个平滑器
+    pose_smoothers: dict = {}
+    face_smoothers: dict = {}
+    prev_face_centroids: dict = {}  # 跨帧人员 ID 追踪
 
     # 打开摄像头
     cap = None
@@ -1055,13 +1406,19 @@ def main():
     current_bpm = None
     bpm_display = None
 
-    # 微表情历史 (用于微分泄漏检测)
-    micro_bs_history = collections.deque(maxlen=4)
-
     # 视图开关
     scramble_mode = False
     noise_mode = False
     attention_mode = False
+    multi_person_mode = False  # 多人识别开关，默认单人
+
+    # 人脸框平滑一下，不然panel2会闪
+    _smooth_fx = _smooth_fy = _smooth_fw = _smooth_fh = None
+    _prev_face_display = None  # 上一帧的人脸显示，防黑闪
+    _face_lost_frames = 0      # 连续丢脸帧计数
+    _pose_lost_frames = 0      # 连续丢姿态帧计数
+    # 手部追踪缓冲，快速移动的时候不会丢
+    _hand_buffer = {}           # {"Left": (landmarks, lost_frames), "Right": (landmarks, lost_frames)}
 
     # 画布: 2x2 布局 + 右侧栏
     canvas = np.zeros((panel_h * 2, panel_w * 2 + sidebar_w, 3), dtype=np.uint8)
@@ -1109,10 +1466,10 @@ def main():
                     else:
                         dl_candidate_label = proposed; dl_candidate_streak = 1
                     dl_scores_cached = dl_scores_ema
-            except Exception:
-                pass  # 推理失败就跳过这一帧
+            except Exception as e:
+                print(f"DL inference error: {e}")
             finally:
-                dl_queue.task_done()
+                pass
 
     threading.Thread(target=dl_worker_loop, daemon=True).start()
 
@@ -1126,6 +1483,11 @@ def main():
                 break
             continue
         cam_fail = 0
+
+        # 线程安全：一次性拷贝 DL 共享状态，避免竞态条件
+        with dl_thread_lock:
+            dl_emotion = dl_emotion_cached
+            dl_scores = dl_scores_cached.copy() if dl_scores_cached is not None else None
 
         # OOD 噪声注入 (在 MediaPipe / DL 处理前)
         if noise_mode:
@@ -1147,42 +1509,101 @@ def main():
         face_landmarker.detect_async(mp_image, frame_timestamp_ms)
         frame_timestamp_ms += 33
 
-        # 使用前一帧的结果（异步延迟一帧）
+        # 用上一帧的结果（异步会晚一帧）
         cur_pose = pose_result
         cur_hand = gesture_result
         cur_face = face_result
 
-        # EMA 平滑
-        smoothed_pose = None
-        if cur_pose and cur_pose.pose_landmarks:
-            smoothed_pose = pose_smoother.update(cur_pose.pose_landmarks[0])
-        else:
-            smoothed_pose = pose_smoother.update([])
+        # --- 多人 ID 分配 ---
+        pose_list = cur_pose.pose_landmarks if cur_pose else []
+        face_list = cur_face.face_landmarks if cur_face else []
+        blendshapes_list = cur_face.face_blendshapes if cur_face else []
 
-        smoothed_face = None
-        if cur_face and cur_face.face_landmarks:
-            smoothed_face = face_smoother.update(cur_face.face_landmarks[0])
-        else:
-            smoothed_face = face_smoother.update([])
+        person_faces, person_poses, prev_face_centroids, unmatched_poses = \
+            assign_person_ids(face_list, pose_list, prev_face_centroids, w, h)
 
-        # Blendshape 情绪推断
-        emotion_label = "Neutral"
-        emotion_score = 0.0
-        face_blends_raw = None
-        micro_bs = None
-        if cur_face and cur_face.face_blendshapes:
-            face_blends_raw = cur_face.face_blendshapes[0]
-            emotion_label, emotion_score = classify_emotion(face_blends_raw)
-            # 存微表情历史，给导数分析用
-            micro_bs = {bs.category_name: bs.score for bs in face_blends_raw}
-            micro_bs_history.append(micro_bs)
+        # 单人模式：只保留 person 0
+        if not multi_person_mode:
+            person_faces = {0: person_faces[0]} if 0 in person_faces else {}
+            person_poses = {0: person_poses[0]} if 0 in person_poses else {}
+            prev_face_centroids = {0: prev_face_centroids[0]} if 0 in prev_face_centroids else {}
+            unmatched_poses = []
 
-        # 头部姿态估计
+        _pil_person_count = len(person_faces) or len(person_poses)
+
+        # --- 平滑每个人的骨架和人脸 ---
+        smoothed_poses = {}
+        for pid in sorted(person_poses.keys()):
+            pl = person_poses[pid]
+            s = _get_or_create_smoother(pose_smoothers, pid, 0.5, 30)
+            # 手臂交叉的时候MediaPipe会把左右搞反，检测一下要不要交换
+            if pl is not None and s.smoothed is not None and len(pl) >= 17 and len(s.smoothed) >= 17:
+                _pairs = [(11, 12), (13, 14), (15, 16)]  # 肩/肘/腕
+                _cur_dist, _swap_dist = 0.0, 0.0
+                _n = 0
+                for _li, _ri in _pairs:
+                    if (getattr(pl[_li], "visibility", 0) > 0.5
+                            and getattr(pl[_ri], "visibility", 0) > 0.5
+                            and getattr(s.smoothed[_li], "visibility", 0) > 0.5
+                            and getattr(s.smoothed[_ri], "visibility", 0) > 0.5):
+                        _cur_dist += ((pl[_li].x - s.smoothed[_li].x)**2
+                                      + (pl[_li].y - s.smoothed[_li].y)**2
+                                      + (pl[_ri].x - s.smoothed[_ri].x)**2
+                                      + (pl[_ri].y - s.smoothed[_ri].y)**2)
+                        _swap_dist += ((pl[_li].x - s.smoothed[_ri].x)**2
+                                       + (pl[_li].y - s.smoothed[_ri].y)**2
+                                       + (pl[_ri].x - s.smoothed[_li].x)**2
+                                       + (pl[_ri].y - s.smoothed[_li].y)**2)
+                        _n += 1
+                if _n > 0 and _swap_dist < _cur_dist * 0.6:
+                    _pl = list(pl)
+                    for _li, _ri in _pairs:
+                        _pl[_li], _pl[_ri] = _pl[_ri], _pl[_li]
+                    pl = _pl
+            # alpha调高点跟手快，加个单帧位移上限防骨架乱飞
+            s.alpha = 0.90
+            if pl is not None and s.smoothed is not None and len(pl) == len(s.smoothed):
+                _max_step = 0.06  # 一帧最多动这么多，超过就是抽风
+                for i in range(len(pl)):
+                    if getattr(pl[i], "visibility", 0) > 0.5:
+                        _dx = pl[i].x - s.smoothed[i].x
+                        _dy = pl[i].y - s.smoothed[i].y
+                        _d = (_dx * _dx + _dy * _dy) ** 0.5
+                        if _d > _max_step:
+                            _scale = _max_step / _d
+                            pl[i].x = s.smoothed[i].x + _dx * _scale
+                            pl[i].y = s.smoothed[i].y + _dy * _scale
+            smoothed_poses[pid] = s.update(pl) if pl is not None else s.update([])
+
+        smoothed_faces = {}
+        for pid in sorted(person_faces.keys()):
+            face_lms, _, _, _, _ = person_faces[pid]
+            s = _get_or_create_smoother(face_smoothers, pid, 0.5, 15)
+            smoothed_faces[pid] = s.update(face_lms)
+
+        # --- 每个人的表情从blendshape拿 ---
+        person_emotions = {}
+        person_blends_raw = {}
+        for pid, (_, _, _, _, orig_idx) in person_faces.items():
+            if blendshapes_list and orig_idx < len(blendshapes_list):
+                bs = blendshapes_list[orig_idx]
+                el, es, mbs = classify_emotion(bs)
+                person_emotions[pid] = (el, es, mbs)
+                person_blends_raw[pid] = bs
+
+        # --- 主人物 (person 0) 的便捷引用 ---
+        primary_face = smoothed_faces.get(0)
+        primary_pose = smoothed_poses.get(0)
+        emotion_label = person_emotions.get(0, ("Neutral", 0.0, {}))[0]
+        emotion_score = person_emotions.get(0, ("Neutral", 0.0, {}))[1]
+        face_blends_raw = person_blends_raw.get(0)
+
+        # --- 头部姿态估计 (仅 person 0) ---
         head_pose_angles = None
         head_pose_img_pts = None
         head_pose_text = ""
-        if smoothed_face and len(smoothed_face) > 263:
-            head_pose_angles, head_pose_img_pts = estimate_head_pose(smoothed_face, w, h)
+        if primary_face and len(primary_face) > 263:
+            head_pose_angles, head_pose_img_pts = estimate_head_pose(primary_face, w, h)
             if head_pose_angles is not None:
                 p, y, r = head_pose_angles
                 dir_y = "R" if y > 5 else ("L" if y < -5 else "C")
@@ -1194,33 +1615,63 @@ def main():
         panel2.fill(0)
 
         # PIL后处理用的数据变量
-        _pil_emotion_scores = None     # scores array for emotion bars, or None
-        _pil_p2_no_face = False        # "No face detected" flag
-        _pil_p3_pose_text = None       # (text, color_bgr) for panel 3 pose info
-        _pil_p3_hand_count = 0         # number of hands detected
-        _pil_p3_gesture_labels = []    # list of (handedness, gesture_name, wrist_x, wrist_y)
-        _pil_p3_attention = False      # ST-GCN注意力模式标志
-        _pil_p4_top_emotion = None     # (label, score, color_bgr, fx, fy, fw, fh) top-1 following face bbox
-        _pil_p4_emotion_hint = None    # fallback emotion text when no intent
-        _pil_notification = None       # (text, is_alert) for intent notification card
-        _pil_cognitive_alert = None    # (text, bg_color_bgr) for cognitive alert
+        _pil_emotion_scores = {}          # pid -> scores array
+        _pil_p2_no_face = False           # "No face detected" flag
+        _pil_p3_pose_texts = {}           # pid -> (text, color_bgr)
+        _pil_p3_hand_count = 0
+        _pil_p3_gesture_labels = []
+        _pil_p3_attention = False
+        _pil_p4_face_bboxes = []          # list of (pid, fx, fy, fw, fh, label, score, color)
+        _pil_p4_top_emotion = None
+        _pil_p4_emotion_hint = None
+        _pil_p4_facial_actions = []    # 脸框旁持续显示的面部动作
+        _pil_notification = None
+        _pil_cognitive_alert = None
+        _pil_advanced_alert = None
+        _pil_bpm_text = None
+        _pil_mode_list = []
+        _pil_person_count = len(person_faces) or len(person_poses)
 
-        _pil_advanced_alert = None     # (text, bg_color_bgr) for advanced alert
-        _pil_bpm_text = None           # (text, color_bgr) for BPM display
-        _pil_mode_list = []            # list of (text, color_bgr) for active modes
-
-        # 面板1：原始画面（或加密模式下的乱码）
+        # 左上角：原始画面（或者加密模式下的乱码）
         if scramble_mode:
             scrambled = apply_scramble(frame)
             cv2.resize(scrambled, (panel_w, panel_h), dst=panel1)
         else:
             cv2.resize(frame, (panel_w, panel_h), dst=panel1)
 
-        if smoothed_face and face_blends_raw:
-            fx, fy, fw, fh = get_face_bbox(smoothed_face, w, h, margin=0.35)
+        # 人脸丢了别急着算无人，等15帧再说
+        if primary_face and face_blends_raw:
+            _face_lost_frames = 0
+        else:
+            _face_lost_frames += 1
+        _face_stable_lost = _face_lost_frames >= 15
+
+        fxp4 = fyp4 = fwp4 = fhp4 = 0
+        if primary_face and face_blends_raw:
+            fx, fy, fw, fh = get_face_bbox(primary_face, w, h, margin=0.35)
             fx, fy = max(0, fx), max(0, fy)
             fw = min(fw, w - fx)
             fh = min(fh, h - fy)
+
+            # 平滑一下bbox不然panel2会闪
+            if _smooth_fx is None:
+                _smooth_fx, _smooth_fy = fx, fy
+                _smooth_fw, _smooth_fh = fw, fh
+            else:
+                alpha = 0.35
+                _smooth_fx += (fx - _smooth_fx) * alpha
+                _smooth_fy += (fy - _smooth_fy) * alpha
+                _smooth_fw += (fw - _smooth_fw) * alpha
+                _smooth_fh += (fh - _smooth_fh) * alpha
+            fx = int(_smooth_fx)
+            fy = int(_smooth_fy)
+            fw = int(_smooth_fw)
+            fh = int(_smooth_fh)
+
+            # 算一下总览里的人脸框，缩放一下，边距小一点
+            sf = panel_w / w  # 缩放因子
+            fxp4, fyp4 = int(fx * sf), int(fy * sf)
+            fwp4, fhp4 = int(fw * sf), int(fh * sf)
 
             if fw > 0 and fh > 0:
                 face_crop = frame[fy:fy+fh, fx:fx+fw].copy()
@@ -1235,11 +1686,14 @@ def main():
                     g_mean = float(np.mean(forehead_roi[:, :, 1]))
                     rppg_buffer.append(g_mean)
 
-                # 提交DL推理任务到常驻线程（非阻塞）
-                if frame_count % 2 == 0 and not dl_queue.full():
-                    dl_queue.put(face_crop.copy())
+                # 丢给DL去推理，不阻塞主线程，队列满了就跳过
+                if frame_count % 2 == 0:
+                    try:
+                        dl_queue.put_nowait(face_crop.copy())
+                    except queue.Full:
+                        pass
 
-                scaled = [ScaledLandmark(lm, fx, fy, fw, fh, w, h) for lm in smoothed_face]
+                scaled = [ScaledLandmark(lm, fx, fy, fw, fh, w, h) for lm in primary_face]
 
                 # 画面部网格 + 情绪高亮
                 drawing_utils.draw_landmarks(
@@ -1248,7 +1702,7 @@ def main():
                     landmark_drawing_spec=face_tess,
                     connection_drawing_spec=face_tess,
                 )
-                draw_emotion_focus(face_crop, scaled, dl_emotion_cached or "Neutral")
+                draw_emotion_focus(face_crop, scaled, dl_emotion or "Neutral")
 
                 # 在裁剪脸上画头部姿态坐标轴
                 if head_pose_angles is not None and head_pose_img_pts is not None:
@@ -1261,39 +1715,65 @@ def main():
                     draw_head_pose_axes(face_crop, np.array(crop_img_pts), head_pose_angles, size=30)
 
                 cv2.resize(face_crop, (panel_w, panel_h), dst=panel2)
+                _prev_face_display = panel2.copy()
 
-            # 收集情绪分数，供侧边栏柱状图用
-            if dl_scores_cached is not None:
-                _pil_emotion_scores = dl_scores_cached
-            else:
+            # 收集情绪分数，供侧边栏柱状图用 (person 0)
+            if dl_scores is not None:
+                _pil_emotion_scores[0] = dl_scores
+            elif face_blends_raw is not None:
                 s = {bs.category_name: bs.score for bs in face_blends_raw}
-                _pil_emotion_scores = np.array([
-                    avg2(s, "mouthSmileLeft", "mouthSmileRight"),                    # Happiness
-                    max(s.get("browInnerUp", 0), avg2(s, "mouthFrownLeft", "mouthFrownRight")),  # Sadness
-                    max(s.get("browInnerUp", 0), s.get("jawOpen", 0)),              # Surprise
+                _bs_raw = [
+                    avg2(s, "mouthSmileLeft", "mouthSmileRight"),
+                    max(s.get("browInnerUp", 0), avg2(s, "mouthFrownLeft", "mouthFrownRight")),
+                    max(s.get("browInnerUp", 0), s.get("jawOpen", 0)),
                     max(avg2(s, "browDownLeft", "browDownRight"),
-                        avg2(s, "mouthFrownLeft", "mouthFrownRight")),               # Anger
-                    max(s.get("browInnerUp", 0), s.get("jawOpen", 0)) * 0.8,        # Fear
+                        avg2(s, "mouthFrownLeft", "mouthFrownRight")),
+                    max(s.get("browInnerUp", 0), s.get("jawOpen", 0)) * 0.8,
                     max(avg2(s, "noseSneerLeft", "noseSneerRight"),
-                        avg2(s, "mouthUpperUpLeft", "mouthUpperUpRight")),           # Disgust
-                    s.get("_neutral", 0),                                            # Neutral
-                    s.get("mouthPressLeft", 0) * 0.5,                               # Contempt
-                ], dtype=np.float64)
-        else:
+                        avg2(s, "mouthUpperUpLeft", "mouthUpperUpRight")),
+                    s.get("_neutral", 0),
+                    s.get("mouthPressLeft", 0) * 0.5,
+                ]
+                _pil_emotion_scores[0] = np.array(_bs_raw[:len(EMOTION_LABELS)], dtype=np.float64)
+        elif _face_stable_lost:
             _pil_p2_no_face = True
+        if not (primary_face and face_blends_raw):
+            if _prev_face_display is not None:
+                np.copyto(panel2, _prev_face_display)
 
         # 面板3：身体骨骼 + 关节角度 + 手势
         panel3.fill(0)
 
         prev_pose_from_history = pose_history[-2] if len(pose_history) >= 2 else None
-        if smoothed_pose:
-            draw_pose_full(panel3, smoothed_pose, panel_w, panel_h,
-                           prev_landmarks=prev_pose_from_history, attention_mode=attention_mode)
-            draw_joint_angles(panel3, smoothed_pose, panel_w, panel_h)
-            n_visible = sum(1 for lm in smoothed_pose if getattr(lm, "visibility", 0) > 0.5)
-            _pil_p3_pose_text = (f"Pose: {n_visible}/33", (0, 255, 0))
+        # --- 多人骨架渲染 ---
+        for pid in sorted(smoothed_poses.keys()):
+            sp = smoothed_poses[pid]
+            if sp is None:
+                continue
+            color = _PERSON_COLORS_BGR[pid % len(_PERSON_COLORS_BGR)]
+            cn_color = tuple(int(c * 0.5) for c in color)
+            draw_pose_full(panel3, sp, panel_w, panel_h,
+                           lm_color=color, cn_color=cn_color,
+                           thickness=3, skip_face=False,
+                           prev_landmarks=(prev_pose_from_history if pid == 0 else None),
+                           attention_mode=attention_mode)
+            if pid == 0:
+                draw_joint_angles(panel3, sp, panel_w, panel_h)
+            n_visible = sum(1 for lm in sp if getattr(lm, "visibility", 0) > 0.5)
+            _pil_p3_pose_texts[pid] = (f"P{pid}: {n_visible}/33", color)
+
+        # 未关联到人脸的姿态用灰色绘制
+        for up_lms in unmatched_poses:
+            draw_pose_full(panel3, up_lms, panel_w, panel_h,
+                           lm_color=(150, 150, 150), cn_color=(100, 100, 100),
+                           thickness=1, skip_face=False)
+
+        if smoothed_poses or unmatched_poses:
+            _pose_lost_frames = 0
         else:
-            _pil_p3_pose_text = ("Pose: NOT FOUND - step back", (0, 0, 255))
+            _pose_lost_frames += 1
+        if _pose_lost_frames >= 12:
+            _pil_p3_pose_texts[-1] = ("Pose: NOT FOUND - step back", (0, 0, 255))
 
         current_active_gestures = set()
         two_hand_heart = False
@@ -1303,22 +1783,82 @@ def main():
             two_hand_heart = True
             current_active_gestures.add("Two_Handed_Heart")
 
+        # 手部追踪缓冲：更新检测到的手，丢失的手保留最多8帧渐隐
         if cur_hand and cur_hand.hand_landmarks:
             _pil_p3_hand_count = len(cur_hand.hand_landmarks)
+            detected = set()
             for i, hand_lms in enumerate(cur_hand.hand_landmarks):
                 handedness = cur_hand.handedness[i][0].category_name
-                lm_s, cn_s = (left_lm, left_cn) if handedness == "Left" else (right_lm, right_cn)
-                drawing_utils.draw_landmarks(
-                    image=panel3, landmark_list=hand_lms,
-                    connections=HandLandmarksConnections.HAND_CONNECTIONS,
-                    landmark_drawing_spec=lm_s, connection_drawing_spec=cn_s,
-                )
+                hand_conf = cur_hand.handedness[i][0].score
+                # 脸被误识别成手了，看手腕有没有贴到脸上
+                _face_lms = smoothed_faces.get(0)
+                if _face_lms is not None and len(_face_lms) > 14:
+                    # 取鼻尖和上唇的中间点当脸的中心
+                    _cx = (_face_lms[1].x + _face_lms[13].x) * 0.5
+                    _cy = (_face_lms[1].y + _face_lms[13].y) * 0.5
+                    _wx, _wy = hand_lms[0].x, hand_lms[0].y
+                    if (_cx - _wx) ** 2 + (_cy - _wy) ** 2 < 0.0049:
+                        continue
+                detected.add(handedness)
+                _hand_buffer[handedness] = (hand_lms, 0, hand_conf)
+            for _h in list(_hand_buffer.keys()):
+                if _h not in detected:
+                    lms, lost, conf = _hand_buffer[_h]
+                    lost += 1
+                    if lost <= 8:
+                        _hand_buffer[_h] = (lms, lost, conf)
+                    else:
+                        del _hand_buffer[_h]
+        else:
+            _pil_p3_hand_count = 0
+            for _h in list(_hand_buffer.keys()):
+                lms, lost, conf = _hand_buffer[_h]
+                lost += 1
+                if lost <= 8:
+                    _hand_buffer[_h] = (lms, lost, conf)
+                else:
+                    del _hand_buffer[_h]
+
+        # 渲染缓冲中的所有手
+        for handedness, (hand_lms, lost, hand_conf) in list(_hand_buffer.items()):
+            lm_s, cn_s = (left_lm, left_cn) if handedness == "Left" else (right_lm, right_cn)
+            if lost > 0:
+                fade = max(0.25, 1.0 - lost / 9.0)
+                lm_s = drawing_utils.DrawingSpec(
+                    color=tuple(int(c * fade) for c in lm_s.color),
+                    thickness=lm_s.thickness, circle_radius=lm_s.circle_radius)
+                cn_s = drawing_utils.DrawingSpec(
+                    color=tuple(int(c * fade) for c in cn_s.color),
+                    thickness=cn_s.thickness, circle_radius=cn_s.circle_radius)
+            drawing_utils.draw_landmarks(
+                image=panel3, landmark_list=hand_lms,
+                connections=HandLandmarksConnections.HAND_CONNECTIONS,
+                landmark_drawing_spec=lm_s, connection_drawing_spec=cn_s,
+            )
+            # 手腕与胳膊骨架连线
+            primary_pose = smoothed_poses.get(0)
+            if primary_pose is not None:
+                wrist_idx = 15 if handedness == "Left" else 16
+                pw = primary_pose[wrist_idx]
+                px_w, py_w = int(pw.x * panel_w), int(pw.y * panel_h)
+                hw = hand_lms[0]
+                hx_w, hy_w = int(hw.x * panel_w), int(hw.y * panel_h)
+                cv2.line(panel3, (px_w, py_w), (hx_w, hy_w),
+                         cn_s.color, cn_s.thickness)
+
+        # 手势识别，只认当前帧检测到的手
+        if cur_hand and cur_hand.hand_landmarks:
+            for i, hand_lms in enumerate(cur_hand.hand_landmarks):
+                handedness = cur_hand.handedness[i][0].category_name
+                hand_conf = cur_hand.handedness[i][0].score
+                if hand_conf < 0.55:
+                    continue
                 ml_gesture = None
-                if (gesture_result and gesture_result.gestures
-                        and i < len(gesture_result.gestures)
-                        and gesture_result.gestures[i]):
-                    cat = gesture_result.gestures[i][0]
-                    if cat.category_name != "None" and cat.score > 0.5:
+                if (cur_hand and cur_hand.gestures
+                        and i < len(cur_hand.gestures)
+                        and cur_hand.gestures[i]):
+                    cat = cur_hand.gestures[i][0]
+                    if cat.category_name != "None" and cat.score > 0.6:
                         ml_gesture = cat.category_name
                 if two_hand_heart:
                     ml_gesture = "Two_Handed_Heart"
@@ -1339,38 +1879,88 @@ def main():
         # 面板4：融合视图
         cv2.resize(frame, (panel_w, panel_h), dst=panel4)
 
-        if smoothed_pose:
+        # 把骨架画到总览上，单人蓝色半透明，多人每人一个颜色
+        if smoothed_poses:
             pose_overlay.fill(0)
-            draw_pose_full(pose_overlay, smoothed_pose, panel_w, panel_h,
-                           lm_color=(0, 220, 0), cn_color=(200, 100, 0),
-                           thickness=2, skip_face=True,
-                           prev_landmarks=prev_pose_from_history, attention_mode=attention_mode)
+            for pid in sorted(smoothed_poses.keys()):
+                sp = smoothed_poses[pid]
+                if sp is None:
+                    continue
+                if multi_person_mode:
+                    color = _PERSON_COLORS_BGR[pid % len(_PERSON_COLORS_BGR)]
+                else:
+                    color = (200, 50, 0)  # 半透明蓝 (BGR)
+                cn_color = tuple(int(c * 0.7) for c in color)
+                draw_pose_full(pose_overlay, sp, panel_w, panel_h,
+                               lm_color=color, cn_color=cn_color,
+                               thickness=2, skip_face=True,
+                               prev_landmarks=(prev_pose_from_history if pid == 0 else None),
+                               attention_mode=attention_mode)
             cv2.addWeighted(pose_overlay, 0.50, panel4, 1.0, 0, dst=panel4)
 
-        if cur_hand and cur_hand.hand_landmarks:
-            for i, hand_lms in enumerate(cur_hand.hand_landmarks):
-                handedness = cur_hand.handedness[i][0].category_name
-                lm_s, cn_s = (left_lm, left_cn) if handedness == "Left" else (right_lm, right_cn)
-                drawing_utils.draw_landmarks(
-                    image=panel4, landmark_list=hand_lms,
-                    connections=HandLandmarksConnections.HAND_CONNECTIONS,
-                    landmark_drawing_spec=lm_s, connection_drawing_spec=cn_s,
-                )
+        for handedness, (hand_lms, lost, hand_conf) in list(_hand_buffer.items()):
+            lm_s, cn_s = (left_lm, left_cn) if handedness == "Left" else (right_lm, right_cn)
+            if lost > 0:
+                fade = max(0.25, 1.0 - lost / 9.0)
+                lm_s = drawing_utils.DrawingSpec(
+                    color=tuple(int(c * fade) for c in lm_s.color),
+                    thickness=lm_s.thickness, circle_radius=lm_s.circle_radius)
+                cn_s = drawing_utils.DrawingSpec(
+                    color=tuple(int(c * fade) for c in cn_s.color),
+                    thickness=cn_s.thickness, circle_radius=cn_s.circle_radius)
+            drawing_utils.draw_landmarks(
+                image=panel4, landmark_list=hand_lms,
+                connections=HandLandmarksConnections.HAND_CONNECTIONS,
+                landmark_drawing_spec=lm_s, connection_drawing_spec=cn_s,
+            )
 
-        if smoothed_face:
-            fx, fy, fw, fh = get_face_bbox(smoothed_face, panel_w, panel_h, margin=0.15)
-            cv2.rectangle(panel4, (fx, fy), (fx+fw, fy+fh), (0, 255, 0), 2)
-            if dl_scores_cached is not None:
-                best_idx = int(np.argmax(dl_scores_cached))
-                _pil_p4_top_emotion = (
-                    EMOTION_LABELS[best_idx],
-                    float(dl_scores_cached[best_idx]),
-                    _EMOTION_COLORS_8.get(EMOTION_LABELS[best_idx], (255, 255, 255)),
-                    fx, fy, fw, fh,
-                )
+        # 多人脸框 + person 标签
+        sf = panel_w / w
+        for pid in sorted(person_faces.keys()):
+            face_lms, _, _, _, _ = person_faces[pid]
+            sm_face = smoothed_faces.get(pid)
+            if sm_face is None:
+                continue
+            fx_f, fy_f, fw_f, fh_f = get_face_bbox(sm_face, w, h, margin=0)
+            fxp = int(fx_f * sf)
+            fyp = int(fy_f * sf)
+            fwp = int(fw_f * sf)
+            fhp = int(fh_f * sf)
+            if multi_person_mode:
+                color = _PERSON_COLORS_BGR[pid % len(_PERSON_COLORS_BGR)]
+                cv2.putText(panel4, f"P{pid}", (fxp, fyp - 6),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 2)
+            else:
+                color = (0, 220, 0)  # 单人模式绿框
+            cv2.rectangle(panel4, (fxp, fyp), (fxp + fwp, fyp + fhp), color, 2)
 
-        # 多模态意图融合（情绪 + 手势）
-        dominant_emotion = dl_emotion_cached or emotion_label
+        # P0的DL情绪标签（人脸框上面那个循环已经画了）
+        if 0 in smoothed_faces and primary_face and dl_scores is not None:
+            best_idx = int(np.argmax(dl_scores))
+            _pil_p4_top_emotion = (
+                EMOTION_LABELS[best_idx],
+                float(dl_scores[best_idx]),
+                _EMOTION_COLORS_8.get(EMOTION_LABELS[best_idx], (255, 255, 255)),
+                fxp4, fyp4, fwp4, fhp4,
+            )
+
+        # 次要人物的 blendshape 情绪标签
+        for pid in sorted(person_faces.keys()):
+            if pid == 0 or pid not in person_emotions:
+                continue
+            em_label, em_score, _ = person_emotions[pid]
+            sm_face = smoothed_faces.get(pid)
+            if sm_face:
+                fx_f, fy_f, fw_f, fh_f = get_face_bbox(sm_face, w, h, margin=0)
+                fxp_s = int(fx_f * sf)
+                fyp_s = int(fy_f * sf)
+                fwp_s = int(fw_f * sf)
+                color = _PERSON_COLORS_BGR[pid % len(_PERSON_COLORS_BGR)]
+                _pil_p4_face_bboxes.append((pid, fxp_s, fyp_s + fhp_s + 4,
+                                            em_label, em_score, color))
+
+        # 把表情和手势合在一起猜意图
+        dominant_emotion = dl_emotion or emotion_label
         dominant_gesture = next(iter(current_active_gestures), None) if current_active_gestures else None
         intent = synthesize_intent(dominant_emotion, dominant_gesture)
         if intent:
@@ -1390,7 +1980,7 @@ def main():
         prev_time = current_time
         frame_count += 1
 
-        # rPPG心率估计（每15帧算一次，EMA平滑）
+        # rPPG心率，每15帧算一次
         if frame_count % 15 == 0 and len(rppg_buffer) >= 120:
             raw_bpm = estimate_heart_rate(rppg_buffer, fps)
             if raw_bpm is not None:
@@ -1404,16 +1994,19 @@ def main():
         _pil_bpm_text = bpm_display
 
 
-        # ---- 高级认知引擎（视线-手指 + 微表情）----
+        # ---- 脸上的动作标签 ----
+        _pil_p4_facial_actions = []
+        if face_blends_raw:
+            _pil_p4_facial_actions = get_facial_actions(face_blends_raw, top_n=4)
+
+        # ---- 看你眼睛看的方向和手指指的方向差多少 ----
         adv_result = None
         if face_blends_raw:
             cur_hand_list = cur_hand.hand_landmarks if (cur_hand and cur_hand.hand_landmarks) else None
             adv_result = advanced_cognitive_engine(
                 cur_hand_list, head_pose_angles,
-                micro_bs, micro_bs_history,
-                dominant_emotion, dominant_gesture,
+                dominant_gesture,
             )
-
 
         # 高级警报覆盖通知
         if adv_result is not None:
@@ -1424,6 +2017,7 @@ def main():
             ("NOISE", noise_mode, (255, 100, 100)),
             ("SCRAMBLE", scramble_mode, (100, 100, 255)),
             ("ATTN", attention_mode, (255, 200, 50)),
+            ("MULTI", multi_person_mode, (100, 255, 200)),
         ]:
             if is_on:
                 _pil_mode_list.append((mode_name, color))
@@ -1434,7 +2028,7 @@ def main():
         canvas[panel_h:panel_h * 2, :panel_w] = panel3
         canvas[panel_h:panel_h * 2, panel_w:panel_w * 2] = panel4
 
-        # 统一用PIL做后处理（标题/文字/圆角卡片）
+        # 统一用PIL画标题、文字、圆角卡片
         pil_canvas = Image.fromarray(cv2.cvtColor(canvas, cv2.COLOR_BGR2RGBA))
         pil_draw = ImageDraw.Draw(pil_canvas)
 
@@ -1456,51 +2050,58 @@ def main():
             bbox = pil_draw.textbbox((0, 0), text, font=font)
             return (bbox[2] - bbox[0]) + pad_x * 2
 
+        # 统一四个面板标题卡片的宽度，取最宽的为准
+        _titles = ["Original", "Expression", "Body Skeleton", "Combined"]
+        _uniform_title_w = max(_title_card_w(t, font_panel) for t in _titles)
+
         # 面板1：标题右下角，FPS左上角
         p1_title = "Original [ENCRYPTED]" if scramble_mode else "Original"
-        p1t_w = _title_card_w(p1_title, font_panel)
-        draw_modern_hud_panel(pil_draw, p1_title, panel_w - p1t_w - 8, panel_h - 36,
+        draw_modern_hud_panel(pil_draw, p1_title, panel_w - _uniform_title_w - 8, panel_h - 36,
                               font_panel, pad_x=14, pad_y=8, radius=10,
                               text_color=(255, 100, 100, 255) if scramble_mode else (200, 200, 200, 255),
-                              bg_color=(80, 0, 0, 200) if scramble_mode else (30, 30, 30, 180))
-        # FPS放左上角
-        fps_str = f"FPS: {int(fps)}"
-        pil_draw.text((14, 10), fps_str, font=font_tiny, fill=(0, 255, 0, 255))
+                              bg_color=(80, 0, 0, 200) if scramble_mode else (30, 30, 30, 180),
+                              accent_color=(200, 50, 50, 255) if scramble_mode else (0, 200, 200, 255),
+                              card_width=_uniform_title_w)
+        # FPS 药丸徽章：颜色按帧率分档
+        if fps >= 25:
+            fps_color = (0, 180, 80)
+        elif fps >= 15:
+            fps_color = (200, 160, 0)
+        else:
+            fps_color = (200, 40, 40)
+        fps_str = f"FPS {int(fps)}"
+        fps_bbox = pil_draw.textbbox((0, 0), fps_str, font=font_tiny)
+        fps_tw, fps_th = fps_bbox[2] - fps_bbox[0], fps_bbox[3] - fps_bbox[1]
+        fps_pad = 10
+        pil_draw.rounded_rectangle(
+            [10, 6, 10 + fps_tw + fps_pad * 2, 6 + fps_th + fps_pad],
+            radius=fps_th // 2 + 4,
+            fill=(fps_color[2] // 6, fps_color[1] // 6, fps_color[0] // 6, 200))
+        pil_draw.text((10 + fps_pad, 6 + fps_pad // 2 - fps_bbox[1]), fps_str,
+                      font=font_tiny, fill=(fps_color[2], fps_color[1], fps_color[0], 255))
 
         # 面板2：标题左下角
-        p2t_w = _title_card_w("Expression", font_panel)
         draw_modern_hud_panel(pil_draw, "Expression", panel_w + 8, panel_h - 36,
                               font_panel, pad_x=14, pad_y=8, radius=10,
-                              text_color=(200, 200, 200, 255), bg_color=(30, 30, 30, 180))
+                              text_color=(200, 200, 200, 255), bg_color=(30, 30, 30, 180),
+                              accent_color=(200, 50, 200, 255), card_width=_uniform_title_w)
 
         # 面板3：标题右上角
-        p3t_w = _title_card_w("Body Skeleton", font_panel)
-        draw_modern_hud_panel(pil_draw, "Body Skeleton", panel_w - p3t_w - 8, panel_h + 8,
+        draw_modern_hud_panel(pil_draw, "Body Skeleton", panel_w - _uniform_title_w - 8, panel_h + 8,
                               font_panel, pad_x=14, pad_y=8, radius=10,
-                              text_color=(200, 200, 200, 255), bg_color=(30, 30, 30, 180))
+                              text_color=(200, 200, 200, 255), bg_color=(30, 30, 30, 180),
+                              accent_color=(50, 200, 50, 255), card_width=_uniform_title_w)
 
         # 面板4：标题左上角，BPM右上角
         draw_modern_hud_panel(pil_draw, "Combined", panel_w + 8, panel_h + 8,
                               font_panel, pad_x=14, pad_y=8, radius=10,
-                              text_color=(200, 200, 200, 255), bg_color=(30, 30, 30, 180))
+                              text_color=(200, 200, 200, 255), bg_color=(30, 30, 30, 180),
+                              accent_color=(200, 150, 0, 255), card_width=_uniform_title_w)
         if _pil_bpm_text is not None:
             bpm_str, bpm_bgr = _pil_bpm_text
             bpm_tw = pil_draw.textbbox((0, 0), bpm_str, font=font_info)[2]
             pil_draw.text((panel_w * 2 - bpm_tw - 14, panel_h + 10),
                           bpm_str, font=font_info, fill=(255, 20, 20, 255))
-        if _pil_p3_hand_count > 0:
-            pil_draw.text((12, panel_h + 64),
-                          f"Hands: {_pil_p3_hand_count}", font=font_small,
-                          fill=(0, 255, 255, 255))
-        for h, g, gx, gy in _pil_p3_gesture_labels:
-            gx_canvas = max(8, min(gx, panel_w - 8))
-            gy_canvas = max(panel_h + 20, min(panel_h + gy - 15, panel_h * 2 - 18))
-            gest_text = f"{h[0]}:{g}"  # abbreviate handedness
-            tw3 = pil_draw.textbbox((0, 0), gest_text, font=font_tiny)[2]
-            tx3 = gx_canvas - tw3 // 2
-            tx3 = max(4, min(tx3, panel_w - tw3 - 4))
-            pil_draw.text((tx3, gy_canvas), gest_text,
-                          font=font_tiny, fill=(0, 255, 255, 220))
         if _pil_p3_attention:
             pil_draw.text((panel_w - 200, panel_h * 2 - 28),
                           "ST-GCN ATTENTION ON", font=font_tiny,
@@ -1530,9 +2131,29 @@ def main():
             pil_draw.text((lx_canvas, ly_canvas), label_text,
                           font=font_emotion, fill=(clr[2], clr[1], clr[0], 255))
 
-        if _pil_p4_emotion_hint and not _pil_notification:
-            pil_draw.text((panel_w + 12, panel_h + 66), _pil_p4_emotion_hint,
-                          font=font_tiny, fill=(180, 180, 180, 200))
+            # 动作标签放情绪下面
+            if _pil_p4_facial_actions:
+                action_y = ly_canvas + 26
+                for action_name, action_val in _pil_p4_facial_actions:
+                    action_text = f"{action_name}: {action_val:.0%}"
+                    pil_draw.text((lx_canvas, action_y), action_text,
+                                  font=font_tiny, fill=(0, 255, 200, 255))
+                    action_y += 15
+
+        # 次要人物的情绪标签
+        for (pid, fx_s, fy_s, em_lbl, em_sc, em_clr) in _pil_p4_face_bboxes:
+            label_s = f"P{pid} {em_lbl} {em_sc:.0%}"
+            sb = pil_draw.textbbox((0, 0), label_s, font=font_tiny)
+            stw = sb[2] - sb[0]
+            sx_l = max(4, min(int(fx_s), panel_w - stw - 8))
+            sy_l = max(4, min(int(fy_s), panel_h - 18))
+            sx_c = panel_w + sx_l
+            sy_c = panel_h + sy_l
+            pil_draw.rounded_rectangle(
+                [sx_c - 3, sy_c - 1, sx_c + stw + 3, sy_c + 18],
+                radius=4, fill=(em_clr[2] // 5, em_clr[1] // 5, em_clr[0] // 5, 160))
+            pil_draw.text((sx_c, sy_c), label_s,
+                          font=font_tiny, fill=(em_clr[2], em_clr[1], em_clr[0], 220))
 
         # 通知/意图卡片
         displayed_notification = None
@@ -1557,7 +2178,7 @@ def main():
                                    radius=12, pad_x=16, pad_y=10,
                                    bounds=_p4_bounds)
 
-        # 认知警报（面板4底部）
+        # 底部的认知警报
         if _pil_cognitive_alert is not None:
             c_alert, c_bg = _pil_cognitive_alert
             draw_pil_text_card(pil_draw, c_alert,
@@ -1568,16 +2189,20 @@ def main():
                                radius=10, pad_x=12, pad_y=6,
                                bounds=_p4_bounds)
 
-        # 模式状态标签（画布底部）
+        # 底部的状态标签，描边风格
         mode_x = 12
         for mode_name, mode_color in _pil_mode_list:
             bbox = pil_draw.textbbox((0, 0), mode_name, font=font_tiny)
             mw, mh = bbox[2] - bbox[0], bbox[3] - bbox[1]
+            r, g, b = mode_color[2], mode_color[1], mode_color[0]
             pil_draw.rounded_rectangle(
                 [mode_x, panel_h * 2 - mh - 16, mode_x + mw + 18, panel_h * 2 - 8],
-                radius=6, fill=(mode_color[2], mode_color[1], mode_color[0], 180))
+                radius=6, fill=(r // 4, g // 4, b // 4, 140))
+            pil_draw.rounded_rectangle(
+                [mode_x, panel_h * 2 - mh - 16, mode_x + mw + 18, panel_h * 2 - 8],
+                radius=6, outline=(r, g, b, 220), width=1)
             pil_draw.text((mode_x + 9, panel_h * 2 - mh - 14), mode_name,
-                          font=font_tiny, fill=(255, 255, 255, 255))
+                          font=font_tiny, fill=(r, g, b, 255))
             mode_x += mw + 28
 
         # 右侧栏：情绪监控面板
@@ -1597,45 +2222,86 @@ def main():
 
         sy = 52
 
-        if _pil_p2_no_face:
-            pil_draw.text((sx + 14, sy + 20), "No face detected",
+        # 人数计数 + 模式标识
+        mode_label = "Multi" if multi_person_mode else "Single"
+        mode_color = (100, 255, 200) if multi_person_mode else (200, 200, 100)
+        mode_str = f"{mode_label}  |  People: {_pil_person_count}" if _pil_person_count > 0 else mode_label
+        mode_tw = pil_draw.textbbox((0, 0), mode_str, font=font_tiny)[2]
+        pil_draw.text((sx + (sw - mode_tw) // 2, 36), mode_str,
+                      font=font_tiny, fill=(mode_color[0], mode_color[1], mode_color[2], 220))
+
+        if _pil_p2_no_face or _pil_person_count == 0:
+            pil_draw.text((sx + 14, sy + 20), "No person detected",
                           font=font_info, fill=(255, 100, 100, 255))
         else:
-            # 深度学习情绪识别结果
-            if dl_emotion_cached is not None and dl_scores_cached is not None:
-                best_idx = int(np.argmax(dl_scores_cached))
-                best_score_dl = float(dl_scores_cached[best_idx])
-                color_dl = _EMOTION_COLORS_8.get(dl_emotion_cached, (0, 255, 0))
-                pil_draw.rounded_rectangle([sx + 10, sy, sx + sw - 10, sy + 26],
+            # 深度学习情绪识别结果 (P0)
+            if dl_emotion is not None and dl_scores is not None:
+                _draw_section_divider(pil_draw, "── STATUS ──", sy, font_tiny, sx, sw)
+                sy += 18
+                best_idx = int(np.argmax(dl_scores))
+                best_score_dl = float(dl_scores[best_idx])
+                color_dl = _EMOTION_COLORS_8.get(dl_emotion, (0, 255, 0))
+                pil_draw.rounded_rectangle([sx + 10, sy, sx + sw - 10, sy + 28],
                                             radius=6, fill=(color_dl[2] // 4, color_dl[1] // 4, color_dl[0] // 4, 120))
-                pil_draw.text((sx + 16, sy + 2), f"DL: {dl_emotion_cached}",
-                              font=font_small, fill=(color_dl[2], color_dl[1], color_dl[0], 255))
+                r_dl, g_dl, b_dl = int(color_dl[2]), int(color_dl[1]), int(color_dl[0])
+                pil_draw.ellipse([sx + 18, sy + 8, sx + 26, sy + 16], fill=(r_dl, g_dl, b_dl, 255))
+                pil_draw.text((sx + 32, sy + 4), f"P0 DL: {dl_emotion}",
+                              font=font_small, fill=(r_dl, g_dl, b_dl, 255))
                 score_x = sx + sw - 16 - pil_draw.textbbox((0, 0), f"{best_score_dl:.0%}", font=font_small)[2]
-                pil_draw.text((score_x, sy + 2), f"{best_score_dl:.0%}",
-                              font=font_small, fill=(color_dl[2], color_dl[1], color_dl[0], 200))
-                sy += 30
+                pil_draw.text((score_x, sy + 4), f"{best_score_dl:.0%}",
+                              font=font_small, fill=(r_dl, g_dl, b_dl, 200))
+                sy += 32
 
-            # 融合变形情绪
-            color_bs = _EMOTION_COLORS_8.get(emotion_label, (0, 200, 255))
-            pil_draw.rounded_rectangle([sx + 10, sy, sx + sw - 10, sy + 26],
-                                        radius=6, fill=(color_bs[2] // 4, color_bs[1] // 4, color_bs[0] // 4, 120))
-            pil_draw.text((sx + 16, sy + 2), f"BS: {emotion_label}",
-                          font=font_small, fill=(color_bs[2], color_bs[1], color_bs[0], 255))
-            score_x = sx + sw - 16 - pil_draw.textbbox((0, 0), f"{emotion_score:.0%}", font=font_small)[2]
-            pil_draw.text((score_x, sy + 2), f"{emotion_score:.0%}",
-                          font=font_small, fill=(color_bs[2], color_bs[1], color_bs[0], 200))
-            sy += 30
+            # P0 blendshape 情绪
+            if 0 in person_emotions:
+                p0_em, p0_sc, _ = person_emotions[0]
+                color_bs = _EMOTION_COLORS_8.get(p0_em, (0, 200, 255))
+                pil_draw.rounded_rectangle([sx + 10, sy, sx + sw - 10, sy + 28],
+                                            radius=6, fill=(color_bs[2] // 4, color_bs[1] // 4, color_bs[0] // 4, 120))
+                r_bs, g_bs, b_bs = int(color_bs[2]), int(color_bs[1]), int(color_bs[0])
+                pil_draw.ellipse([sx + 18, sy + 8, sx + 26, sy + 16], fill=(r_bs, g_bs, b_bs, 255))
+                pil_draw.text((sx + 32, sy + 4), f"P0 BS: {p0_em}",
+                              font=font_small, fill=(r_bs, g_bs, b_bs, 255))
+                score_x = sx + sw - 16 - pil_draw.textbbox((0, 0), f"{p0_sc:.0%}", font=font_small)[2]
+                pil_draw.text((score_x, sy + 4), f"{p0_sc:.0%}",
+                              font=font_small, fill=(r_bs, g_bs, b_bs, 200))
+                sy += 32
 
-            # 姿态信息
-            if _pil_p3_pose_text is not None:
-                txt, clr = _pil_p3_pose_text
+            # 次要人物 blendshape 情绪
+            for pid in sorted(person_emotions.keys()):
+                if pid == 0:
+                    continue
+                p_em, p_sc, _ = person_emotions[pid]
+                p_color = _PERSON_COLORS_BGR[pid % len(_PERSON_COLORS_BGR)]
+                pil_draw.rounded_rectangle([sx + 10, sy, sx + sw - 10, sy + 24],
+                                            radius=5, fill=(p_color[2] // 5, p_color[1] // 5, p_color[0] // 5, 100))
+                pil_draw.ellipse([sx + 18, sy + 6, sx + 24, sy + 12],
+                                 fill=(int(p_color[2]), int(p_color[1]), int(p_color[0]), 255))
+                pil_draw.text((sx + 30, sy + 2), f"P{pid}: {p_em}",
+                              font=font_tiny, fill=(int(p_color[2]), int(p_color[1]), int(p_color[0]), 220))
+                score_x = sx + sw - 16 - pil_draw.textbbox((0, 0), f"{p_sc:.0%}", font=font_tiny)[2]
+                pil_draw.text((score_x, sy + 2), f"{p_sc:.0%}",
+                              font=font_tiny, fill=(int(p_color[2]), int(p_color[1]), int(p_color[0]), 180))
+                sy += 26
+
+            # 每个人的身体状态
+            _draw_section_divider(pil_draw, "── BODY ──", sy, font_tiny, sx, sw)
+            sy += 18
+            for pid in sorted(_pil_p3_pose_texts.keys()):
+                txt, clr = _pil_p3_pose_texts[pid]
                 pil_draw.text((sx + 14, sy), txt, font=font_small,
                               fill=(clr[2], clr[1], clr[0], 255))
-                sy += 22
+                sy += 20 if pid >= 0 else 22
             if _pil_p3_hand_count > 0:
-                pil_draw.text((sx + 14, sy), f"Hands: {_pil_p3_hand_count}",
-                              font=font_tiny, fill=(0, 255, 255, 200))
-                sy += 18
+                for h, g, gx, gy in _pil_p3_gesture_labels:
+                    label = f"{'R' if h[0] == 'R' else 'L'} Hand: {g}"
+                    pil_draw.text((sx + 14, sy), label,
+                                  font=font_tiny, fill=(0, 255, 255, 200))
+                    sy += 16
+                if not _pil_p3_gesture_labels:
+                    pil_draw.text((sx + 14, sy), f"Hands: {_pil_p3_hand_count}",
+                                  font=font_tiny, fill=(0, 255, 255, 200))
+                    sy += 16
 
             # 头部姿态
             if head_pose_text:
@@ -1658,22 +2324,34 @@ def main():
                               font=font_small, fill=bpm_rgba)
                 sy += 32
 
-            # 分隔线
-            sy += 4
-            pil_draw.line([(sx + 14, sy), (sx + sw - 14, sy)],
-                          fill=(80, 80, 100, 150), width=1)
-            sy += 8
+            # 分隔线 → EMOTIONS 分组标题
+            _draw_section_divider(pil_draw, "── EMOTIONS ──", sy, font_tiny, sx, sw)
+            sy += 18
 
-            # 情绪分数条
-            if _pil_emotion_scores is not None:
+            # 情绪分数条 (P0)
+            if _pil_emotion_scores.get(0) is not None:
                 bar_w = sw - 28
                 remaining_h = panel_h * 2 - sy - 20
                 bar_h = min(20, remaining_h // 8 - 5)
                 gap = max(2, bar_h // 8)
                 if bar_h >= 6:
                     draw_pil_emotion_bars(pil_draw, sx + 14, sy, bar_w, bar_h, gap,
-                                          _pil_emotion_scores, EMOTION_LABELS, font_tiny)
+                                          _pil_emotion_scores[0], EMOTION_LABELS, font_tiny)
                     sy += (bar_h + gap) * 8 + 6
+
+            # 多人颜色图例
+            if _pil_person_count > 1:
+                _draw_section_divider(pil_draw, "── PEOPLE ──", sy, font_tiny, sx, sw)
+                sy += 16
+                for pid in sorted(person_faces.keys()):
+                    color = _PERSON_COLORS_BGR[pid % len(_PERSON_COLORS_BGR)]
+                    r_c, g_c, b_c = int(color[2]), int(color[1]), int(color[0])
+                    pil_draw.ellipse([sx + 14, sy + 4, sx + 22, sy + 12], fill=(r_c, g_c, b_c, 255))
+                    em_info = person_emotions.get(pid, (None, 0.0, {}))
+                    label = f"P{pid}" + (f"  {em_info[0]}" if em_info[0] else "")
+                    pil_draw.text((sx + 28, sy), label, font=font_tiny, fill=(r_c, g_c, b_c, 220))
+                    sy += 16
+                sy += 4
 
             # 认知分析区
             sy = max(sy, panel_h * 2 - 200)
@@ -1683,62 +2361,49 @@ def main():
             if _pil_notification is not None:
                 notif_text, is_alert = _pil_notification
                 short = notif_text.replace("意图: ", "").replace("[失调警报]", "[!]")
-                lines = _wrap_text_lines(pil_draw, short, font_tiny, _max_side_px)
-                lh = pil_draw.textbbox((0, 0), "Ag", font=font_tiny)[3]
-                row_h = lh * len(lines) + 2 * (len(lines) - 1) + 10
-                color = (255, 80, 80, 255) if is_alert else (0, 220, 220, 255)
-                pil_draw.rounded_rectangle([sx + 8, sy, sx + sw - 8, sy + row_h],
-                                            radius=6, fill=(30, 30, 40, 180))
-                cy = sy + (row_h - lh * len(lines)) // 2
-                for ln in lines:
-                    pil_draw.text((sx + 14, cy), ln, font=font_tiny, fill=color)
-                    cy += lh + 2
-                sy += row_h + 4
+                text_fill = (255, 80, 80, 255) if is_alert else (0, 220, 220, 255)
+                sy = _draw_sidebar_alert_block(pil_draw, short, font_tiny, _max_side_px,
+                                               sx, sw, sy, (30, 30, 40, 180), text_fill)
                 has_cognitive = True
 
             # 认知警报
             if _pil_cognitive_alert is not None:
                 c_alert, c_bg = _pil_cognitive_alert
-                lines = _wrap_text_lines(pil_draw, c_alert, font_tiny, _max_side_px)
-                lh = pil_draw.textbbox((0, 0), "Ag", font=font_tiny)[3]
-                row_h = lh * len(lines) + 2 * (len(lines) - 1) + 10
-                c_rgba = (c_bg[2], c_bg[1], c_bg[0], 255)
-                pil_draw.rounded_rectangle([sx + 8, sy, sx + sw - 8, sy + row_h],
-                                            radius=6,
-                                            fill=(c_bg[2] // 4, c_bg[1] // 4, c_bg[0] // 4, 180))
-                cy = sy + (row_h - lh * len(lines)) // 2
-                for ln in lines:
-                    pil_draw.text((sx + 14, cy), ln, font=font_tiny, fill=c_rgba)
-                    cy += lh + 2
-                sy += row_h + 4
+                sy = _draw_sidebar_alert_block(pil_draw, c_alert, font_tiny, _max_side_px,
+                                               sx, sw, sy,
+                                               (c_bg[2] // 4, c_bg[1] // 4, c_bg[0] // 4, 180),
+                                               (c_bg[2], c_bg[1], c_bg[0], 255))
                 has_cognitive = True
 
             # 高级认知警报
             if _pil_advanced_alert is not None:
                 adv_alert, adv_bg = _pil_advanced_alert
-                lines = _wrap_text_lines(pil_draw, adv_alert, font_tiny, _max_side_px)
-                lh = pil_draw.textbbox((0, 0), "Ag", font=font_tiny)[3]
-                row_h = lh * len(lines) + 2 * (len(lines) - 1) + 10
-                pil_draw.rounded_rectangle([sx + 8, sy, sx + sw - 8, sy + row_h],
-                                            radius=6,
-                                            fill=(adv_bg[2] // 4, adv_bg[1] // 4, adv_bg[0] // 4, 180))
-                cy = sy + (row_h - lh * len(lines)) // 2
-                for ln in lines:
-                    pil_draw.text((sx + 14, cy), ln, font=font_tiny,
-                                  fill=(255, 255, 255, 255))
-                    cy += lh + 2
+                sy = _draw_sidebar_alert_block(pil_draw, adv_alert, font_tiny, _max_side_px,
+                                               sx, sw, sy,
+                                               (adv_bg[2] // 4, adv_bg[1] // 4, adv_bg[0] // 4, 180),
+                                               (255, 255, 255, 255))
                 has_cognitive = True
 
             if not has_cognitive:
                 pil_draw.text((sx + 14, sy + 4), "Awaiting signal...",
                               font=font_tiny, fill=(120, 120, 140, 180))
 
+        # 面板彩色边框
+        _panel_borders = [
+            (0, 0, panel_w, panel_h, (0, 200, 200, 80)),           # Cyan
+            (panel_w, 0, panel_w, panel_h, (200, 50, 200, 80)),    # Magenta
+            (0, panel_h, panel_w, panel_h, (50, 200, 50, 80)),     # Green
+            (panel_w, panel_h, panel_w, panel_h, (200, 150, 0, 80)),  # Orange
+        ]
+        for bx, by_, bw_, bh_, bc in _panel_borders:
+            pil_draw.rectangle([bx, by_, bx + bw_ - 1, by_ + bh_ - 1], outline=bc, width=1)
+
         # 画网格线
         pil_draw.line([(panel_w, 0), (panel_w, panel_h * 2)], fill=(80, 80, 80, 200), width=2)
         pil_draw.line([(0, panel_h), (panel_w * 2, panel_h)], fill=(80, 80, 80, 200), width=2)
 
-        # RGBA转回BGR，给OpenCV显示
-        canvas = cv2.cvtColor(np.array(pil_canvas), cv2.COLOR_RGBA2BGR)
+        # RGBA转回BGR给OpenCV显示，用asarray共享内存不拷贝
+        canvas = cv2.cvtColor(np.asarray(pil_canvas), cv2.COLOR_RGBA2BGR)
 
         cv2.imshow("MediaPipe - Pose + Hands + Face - Press 'q' to exit", canvas)
 
@@ -1756,12 +2421,25 @@ def main():
         elif key == ord("a"):
             attention_mode = not attention_mode
             print(f"Attention mode: {'ON' if attention_mode else 'OFF'}")
+        elif key == ord("m"):
+            multi_person_mode = not multi_person_mode
+            print(f"Multi-person mode: {'ON' if multi_person_mode else 'OFF (single)'}")
 
-        # 存姿态历史，用于时序动力学分析
-        if smoothed_pose is not None:
-            pose_history.append(smoothed_pose)
+        # 存姿态历史 (仅 person 0)，用于时序动力学分析
+        if primary_pose is not None:
+            pose_history.append(primary_pose)
         else:
             pose_history.clear()
+
+        # 定期清理过期的 smoother (每 150 帧 ≈ 5 秒)
+        if frame_count % 150 == 0:
+            current_pids = set(person_faces.keys()) | set(person_poses.keys())
+            for pid in list(pose_smoothers.keys()):
+                if pid not in current_pids:
+                    del pose_smoothers[pid]
+            for pid in list(face_smoothers.keys()):
+                if pid not in person_faces:
+                    del face_smoothers[pid]
 
     # 清理资源
     cap.release()
@@ -1769,11 +2447,6 @@ def main():
     pose_landmarker.close()
     gesture_recognizer.close()
     face_landmarker.close()
-
-
-def avg2(s, k1, k2):
-    """取两个blendshape分数的均值"""
-    return (s.get(k1, 0) + s.get(k2, 0)) / 2
 
 
 if __name__ == "__main__":

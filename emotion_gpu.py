@@ -79,12 +79,14 @@ class EmotiEffLibRecognizerOnnxGPU(EmotiEffLibRecognizerOnnx):
         input_shape = self.ort_session.get_inputs()[0].shape
         if input_shape and input_shape[-1] in (112, 224, 260):
             self.img_size = input_shape[-1]
-            if self.img_size == 112:
-                self.mean = [0.5, 0.5, 0.5]
-                self.std = [0.5, 0.5, 0.5]
-            else:
-                self.mean = [0.485, 0.456, 0.406]
-                self.std = [0.229, 0.224, 0.225]
+        else:
+            self.img_size = 224  # fallback default
+        if self.img_size == 112:
+            self.mean = [0.5, 0.5, 0.5]
+            self.std = [0.5, 0.5, 0.5]
+        else:
+            self.mean = [0.485, 0.456, 0.406]
+            self.std = [0.229, 0.224, 0.225]
 
         if custom_labels:
             self.idx_to_emotion_class = custom_labels
