@@ -8,7 +8,10 @@ from mediapipe.tasks.python.vision import (
     FaceLandmarker, FaceLandmarkerOptions, FaceLandmarksConnections,
     drawing_utils, RunningMode,
 )
-from emotion_gpu import EmotiEffLibRecognizerOnnxGPU
+try:
+    from emotion_gpu import EmotiEffLibRecognizerOnnxGPU
+except ImportError:
+    EmotiEffLibRecognizerOnnxGPU = None
 import time
 import os
 import ctypes
@@ -56,6 +59,40 @@ def _get_or_create_smoother(pool, person_id, alpha, max_lost):
     if person_id not in pool:
         pool[person_id] = EMASmoother(alpha=alpha, max_lost_frames=max_lost)
     return pool[person_id]
+
+
+# ---- 常量 ----
+_MAX_PEOPLE = 4
+_BS_EMOTION_THRESHOLD = 0.35
+_RPPG_MIN_SAMPLES = 120
+_BPM_MIN, _BPM_MAX = 40, 180
+_FACE_BBOX_MARGIN = 0.35
+_FACE_LOST_FRAME_THRESHOLD = 15
+_POSE_LOST_FRAME_THRESHOLD = 12
+_HAND_BUFFER_MAX_LOST = 2
+_HAND_FADE_START = 0
+_MIN_GESTURE_SCORE = 0.6
+_DL_EMA_ALPHA = 0.35
+_FACE_HAND_EXCLUDE_DIST_SQ = 0.0016
+_ARM_SWAP_THRESHOLD = 0.25
+_ARM_MIN_PAIRS = 2
+_POSE_MAX_STEP = 0.15
+_POSE_ALPHA = 0.90
+
+_NODOT_SPEC = drawing_utils.DrawingSpec(color=(0, 0, 0), thickness=0, circle_radius=0)
+
+
+def _fade_specs(lm_s, cn_s, lost):
+    """手部关键点渐隐：丢帧越多越透明"""
+    if lost > _HAND_FADE_START:
+        fade = max(0.15, 1.0 - lost / 3.0)
+        lm_s = drawing_utils.DrawingSpec(
+            color=tuple(int(c * fade) for c in lm_s.color),
+            thickness=lm_s.thickness, circle_radius=lm_s.circle_radius)
+        cn_s = drawing_utils.DrawingSpec(
+            color=tuple(int(c * fade) for c in cn_s.color),
+            thickness=cn_s.thickness, circle_radius=cn_s.circle_radius)
+    return lm_s, cn_s
 
 
 # 根据人脸位置分配人员ID
@@ -246,7 +283,7 @@ def classify_emotion(blendshapes):
         "Disgust": avg("noseSneerLeft","noseSneerRight")
                  + avg("mouthUpperUpLeft","mouthUpperUpRight")*0.5
                  + s.get("browDownLeft",0)*0.3,
-        "Neutral": 1.0-s.get("_neutral",0)*0.3,
+        "Neutral": 0.0,
     }
 
     best = max(scores, key=scores.get)
@@ -1258,7 +1295,9 @@ def main():
     pose_lite = os.path.join(mp_dir, "pose_landmarker_lite.task")
     pose_model = pose_full if os.path.exists(pose_full) else pose_lite
     gesture_model = os.path.join(mp_dir, "gesture_recognizer.task")
-    face_model = os.path.join(mp_dir, "face_landmarker.task")
+    face_model = os.path.join(mp_dir, "face_landmarker_v2.task")
+    if not os.path.exists(face_model):
+        face_model = os.path.join(mp_dir, "face_landmarker.task")  # 兜底用v1
     print(f"Pose model: {'full' if os.path.exists(pose_full) else 'lite'}")
 
     for path in [pose_model, gesture_model, face_model]:
@@ -1297,9 +1336,9 @@ def main():
         base_options=BaseOptions(model_asset_path=gesture_model),
         running_mode=RunningMode.LIVE_STREAM,
         num_hands=2,
-        min_hand_detection_confidence=0.35,
-        min_hand_presence_confidence=0.35,
-        min_tracking_confidence=0.4,
+        min_hand_detection_confidence=0.3,
+        min_hand_presence_confidence=0.3,
+        min_tracking_confidence=0.3,
         result_callback=on_gesture_result,
     ))
     face_landmarker = FaceLandmarker.create_from_options(FaceLandmarkerOptions(
@@ -1529,9 +1568,14 @@ def main():
             prev_face_centroids = {0: prev_face_centroids[0]} if 0 in prev_face_centroids else {}
             unmatched_poses = []
 
-        _pil_person_count = len(person_faces) or len(person_poses)
+        # --- 先平滑人脸 (给身体修正用) ---
+        smoothed_faces = {}
+        for pid in sorted(person_faces.keys()):
+            face_lms, _, _, _, _ = person_faces[pid]
+            s = _get_or_create_smoother(face_smoothers, pid, 0.5, 15)
+            smoothed_faces[pid] = s.update(face_lms)
 
-        # --- 平滑每个人的骨架和人脸 ---
+        # --- 平滑骨架 (用脸和手修正原始检测) ---
         smoothed_poses = {}
         for pid in sorted(person_poses.keys()):
             pl = person_poses[pid]
@@ -1555,31 +1599,43 @@ def main():
                                        + (pl[_ri].x - s.smoothed[_li].x)**2
                                        + (pl[_ri].y - s.smoothed[_li].y)**2)
                         _n += 1
-                if _n > 0 and _swap_dist < _cur_dist * 0.6:
+                if _n > _ARM_MIN_PAIRS and _swap_dist < _cur_dist * _ARM_SWAP_THRESHOLD:
                     _pl = list(pl)
                     for _li, _ri in _pairs:
                         _pl[_li], _pl[_ri] = _pl[_ri], _pl[_li]
                     pl = _pl
-            # alpha调高点跟手快，加个单帧位移上限防骨架乱飞
-            s.alpha = 0.90
+            # 用脸和手修正原始检测 (脸比身体鼻子准, 手比身体手腕准)
+            if pid == 0 and pl is not None and len(pl) >= 17:
+                _face0 = smoothed_faces.get(0)
+                if _face0 is not None and len(_face0) > 4:
+                    pl[0].x += (_face0[0].x - pl[0].x) * 0.30
+                    pl[0].y += (_face0[0].y - pl[0].y) * 0.30
+                if cur_hand and cur_hand.hand_landmarks:
+                    for i, hand_lms in enumerate(cur_hand.hand_landmarks):
+                        handedness = cur_hand.handedness[i][0].category_name
+                        _bw = 15 if handedness == "Left" else 16
+                        _hw = hand_lms[0]
+                        pl[_bw].x += (_hw.x - pl[_bw].x) * 0.30
+                        pl[_bw].y += (_hw.y - pl[_bw].y) * 0.30
+            # alpha高一点跟手快，位移上限兜底防抽风
+            s.alpha = _POSE_ALPHA
             if pl is not None and s.smoothed is not None and len(pl) == len(s.smoothed):
-                _max_step = 0.06  # 一帧最多动这么多，超过就是抽风
+                _clamped = None
                 for i in range(len(pl)):
                     if getattr(pl[i], "visibility", 0) > 0.5:
                         _dx = pl[i].x - s.smoothed[i].x
                         _dy = pl[i].y - s.smoothed[i].y
                         _d = (_dx * _dx + _dy * _dy) ** 0.5
-                        if _d > _max_step:
-                            _scale = _max_step / _d
-                            pl[i].x = s.smoothed[i].x + _dx * _scale
-                            pl[i].y = s.smoothed[i].y + _dy * _scale
+                        if _d > _POSE_MAX_STEP:
+                            if _clamped is None:
+                                import copy
+                                _clamped = copy.deepcopy(pl)
+                            _scale = _POSE_MAX_STEP / _d
+                            _clamped[i].x = s.smoothed[i].x + _dx * _scale
+                            _clamped[i].y = s.smoothed[i].y + _dy * _scale
+                if _clamped is not None:
+                    pl = _clamped
             smoothed_poses[pid] = s.update(pl) if pl is not None else s.update([])
-
-        smoothed_faces = {}
-        for pid in sorted(person_faces.keys()):
-            face_lms, _, _, _, _ = person_faces[pid]
-            s = _get_or_create_smoother(face_smoothers, pid, 0.5, 15)
-            smoothed_faces[pid] = s.update(face_lms)
 
         # --- 每个人的表情从blendshape拿 ---
         person_emotions = {}
@@ -1722,19 +1778,26 @@ def main():
                 _pil_emotion_scores[0] = dl_scores
             elif face_blends_raw is not None:
                 s = {bs.category_name: bs.score for bs in face_blends_raw}
-                _bs_raw = [
-                    avg2(s, "mouthSmileLeft", "mouthSmileRight"),
-                    max(s.get("browInnerUp", 0), avg2(s, "mouthFrownLeft", "mouthFrownRight")),
-                    max(s.get("browInnerUp", 0), s.get("jawOpen", 0)),
-                    max(avg2(s, "browDownLeft", "browDownRight"),
-                        avg2(s, "mouthFrownLeft", "mouthFrownRight")),
-                    max(s.get("browInnerUp", 0), s.get("jawOpen", 0)) * 0.8,
-                    max(avg2(s, "noseSneerLeft", "noseSneerRight"),
-                        avg2(s, "mouthUpperUpLeft", "mouthUpperUpRight")),
-                    s.get("_neutral", 0),
-                    s.get("mouthPressLeft", 0) * 0.5,
-                ]
-                _pil_emotion_scores[0] = np.array(_bs_raw[:len(EMOTION_LABELS)], dtype=np.float64)
+                _bs_map = {
+                    "Happiness": avg2(s, "mouthSmileLeft", "mouthSmileRight"),
+                    "Sadness":  max(s.get("browInnerUp", 0), avg2(s, "mouthFrownLeft", "mouthFrownRight")),
+                    "Surprise": max(s.get("browInnerUp", 0), s.get("jawOpen", 0)),
+                    "Anger":    max(avg2(s, "browDownLeft", "browDownRight"),
+                                    avg2(s, "mouthFrownLeft", "mouthFrownRight")),
+                    "Fear":     max(s.get("browInnerUp", 0),
+                                    avg2(s, "eyeWideLeft", "eyeWideRight")) * 0.7,
+                    "Disgust":  max(avg2(s, "noseSneerLeft", "noseSneerRight"),
+                                    avg2(s, "mouthUpperUpLeft", "mouthUpperUpRight")),
+                    "Neutral":  1.0 - max(
+                        s.get("mouthSmileLeft", 0), s.get("mouthSmileRight", 0),
+                        s.get("browInnerUp", 0), s.get("jawOpen", 0),
+                        s.get("browDownLeft", 0), s.get("browDownRight", 0),
+                        s.get("mouthFrownLeft", 0), s.get("mouthFrownRight", 0),
+                    ),
+                    "Contempt": s.get("mouthPressLeft", 0) * 0.5,
+                }
+                _pil_emotion_scores[0] = np.array(
+                    [_bs_map.get(lbl, 0.0) for lbl in EMOTION_LABELS], dtype=np.float64)
         elif _face_stable_lost:
             _pil_p2_no_face = True
         if not (primary_face and face_blends_raw):
@@ -1744,7 +1807,7 @@ def main():
         # 面板3：身体骨骼 + 关节角度 + 手势
         panel3.fill(0)
 
-        prev_pose_from_history = pose_history[-2] if len(pose_history) >= 2 else None
+        prev_pose_from_history = pose_history[-1] if len(pose_history) >= 1 else None
         # --- 多人骨架渲染 ---
         for pid in sorted(smoothed_poses.keys()):
             sp = smoothed_poses[pid]
@@ -1783,68 +1846,47 @@ def main():
             two_hand_heart = True
             current_active_gestures.add("Two_Handed_Heart")
 
-        # 手部追踪缓冲：更新检测到的手，丢失的手保留最多8帧渐隐
+        # 手部渲染：当前帧检测到的手直接画，不走缓冲避免延迟
+        _pil_p3_hand_count = 0
+        _hand_drawn = set()
         if cur_hand and cur_hand.hand_landmarks:
-            _pil_p3_hand_count = len(cur_hand.hand_landmarks)
-            detected = set()
             for i, hand_lms in enumerate(cur_hand.hand_landmarks):
                 handedness = cur_hand.handedness[i][0].category_name
-                hand_conf = cur_hand.handedness[i][0].score
-                # 脸被误识别成手了，看手腕有没有贴到脸上
-                _face_lms = smoothed_faces.get(0)
-                if _face_lms is not None and len(_face_lms) > 14:
-                    # 取鼻尖和上唇的中间点当脸的中心
-                    _cx = (_face_lms[1].x + _face_lms[13].x) * 0.5
-                    _cy = (_face_lms[1].y + _face_lms[13].y) * 0.5
-                    _wx, _wy = hand_lms[0].x, hand_lms[0].y
-                    if (_cx - _wx) ** 2 + (_cy - _wy) ** 2 < 0.0049:
+                # 幻觉手过滤：真手一定连着胳膊，附近没骨架手腕就是假的
+                _hw = hand_lms[0]
+                _near_arm = False
+                for _sp in smoothed_poses.values():
+                    if _sp is None:
                         continue
-                detected.add(handedness)
-                _hand_buffer[handedness] = (hand_lms, 0, hand_conf)
-            for _h in list(_hand_buffer.keys()):
-                if _h not in detected:
-                    lms, lost, conf = _hand_buffer[_h]
-                    lost += 1
-                    if lost <= 8:
-                        _hand_buffer[_h] = (lms, lost, conf)
-                    else:
-                        del _hand_buffer[_h]
-        else:
-            _pil_p3_hand_count = 0
-            for _h in list(_hand_buffer.keys()):
-                lms, lost, conf = _hand_buffer[_h]
-                lost += 1
-                if lost <= 8:
-                    _hand_buffer[_h] = (lms, lost, conf)
-                else:
-                    del _hand_buffer[_h]
-
-        # 渲染缓冲中的所有手
-        for handedness, (hand_lms, lost, hand_conf) in list(_hand_buffer.items()):
-            lm_s, cn_s = (left_lm, left_cn) if handedness == "Left" else (right_lm, right_cn)
-            if lost > 0:
-                fade = max(0.25, 1.0 - lost / 9.0)
-                lm_s = drawing_utils.DrawingSpec(
-                    color=tuple(int(c * fade) for c in lm_s.color),
-                    thickness=lm_s.thickness, circle_radius=lm_s.circle_radius)
-                cn_s = drawing_utils.DrawingSpec(
-                    color=tuple(int(c * fade) for c in cn_s.color),
-                    thickness=cn_s.thickness, circle_radius=cn_s.circle_radius)
-            drawing_utils.draw_landmarks(
-                image=panel3, landmark_list=hand_lms,
-                connections=HandLandmarksConnections.HAND_CONNECTIONS,
-                landmark_drawing_spec=lm_s, connection_drawing_spec=cn_s,
-            )
-            # 手腕与胳膊骨架连线
-            primary_pose = smoothed_poses.get(0)
-            if primary_pose is not None:
-                wrist_idx = 15 if handedness == "Left" else 16
-                pw = primary_pose[wrist_idx]
-                px_w, py_w = int(pw.x * panel_w), int(pw.y * panel_h)
-                hw = hand_lms[0]
-                hx_w, hy_w = int(hw.x * panel_w), int(hw.y * panel_h)
-                cv2.line(panel3, (px_w, py_w), (hx_w, hy_w),
-                         cn_s.color, cn_s.thickness)
+                    for _wi in (15, 16):
+                        _pw = _sp[_wi]
+                        if ((_hw.x - _pw.x)**2 + (_hw.y - _pw.y)**2) < 0.0144:
+                            _near_arm = True
+                            break
+                    if _near_arm:
+                        break
+                if not _near_arm:
+                    continue
+                _hand_drawn.add(handedness)
+                lm_s, cn_s = (left_lm, left_cn) if handedness == "Left" else (right_lm, right_cn)
+                drawing_utils.draw_landmarks(
+                    image=panel3, landmark_list=hand_lms,
+                    connections=HandLandmarksConnections.HAND_CONNECTIONS,
+                    landmark_drawing_spec=lm_s, connection_drawing_spec=cn_s,
+                )
+                # 手腕与胳膊骨架连线（距离太远就是接反了，不画）
+                pp = smoothed_poses.get(0)
+                if pp is not None:
+                    wrist_idx = 15 if handedness == "Left" else 16
+                    pw = pp[wrist_idx]
+                    hw = hand_lms[0]
+                    _arm_dist = ((pw.x - hw.x) ** 2 + (pw.y - hw.y) ** 2)
+                    if _arm_dist < 0.08:
+                        px_w, py_w = int(pw.x * panel_w), int(pw.y * panel_h)
+                        hx_w, hy_w = int(hw.x * panel_w), int(hw.y * panel_h)
+                        cv2.line(panel3, (px_w, py_w), (hx_w, hy_w),
+                                 cn_s.color, cn_s.thickness)
+            _pil_p3_hand_count = len(_hand_drawn)
 
         # 手势识别，只认当前帧检测到的手
         if cur_hand and cur_hand.hand_landmarks:
@@ -1898,21 +1940,31 @@ def main():
                                attention_mode=attention_mode)
             cv2.addWeighted(pose_overlay, 0.50, panel4, 1.0, 0, dst=panel4)
 
-        for handedness, (hand_lms, lost, hand_conf) in list(_hand_buffer.items()):
-            lm_s, cn_s = (left_lm, left_cn) if handedness == "Left" else (right_lm, right_cn)
-            if lost > 0:
-                fade = max(0.25, 1.0 - lost / 9.0)
-                lm_s = drawing_utils.DrawingSpec(
-                    color=tuple(int(c * fade) for c in lm_s.color),
-                    thickness=lm_s.thickness, circle_radius=lm_s.circle_radius)
-                cn_s = drawing_utils.DrawingSpec(
-                    color=tuple(int(c * fade) for c in cn_s.color),
-                    thickness=cn_s.thickness, circle_radius=cn_s.circle_radius)
-            drawing_utils.draw_landmarks(
-                image=panel4, landmark_list=hand_lms,
-                connections=HandLandmarksConnections.HAND_CONNECTIONS,
-                landmark_drawing_spec=lm_s, connection_drawing_spec=cn_s,
-            )
+        # 手部直接渲染到总览（不走缓冲，不拖影）
+        if cur_hand and cur_hand.hand_landmarks:
+            for i, hand_lms in enumerate(cur_hand.hand_landmarks):
+                handedness = cur_hand.handedness[i][0].category_name
+                # 幻觉手过滤：真手一定连着胳膊
+                _hw = hand_lms[0]
+                _near_arm = False
+                for _sp in smoothed_poses.values():
+                    if _sp is None:
+                        continue
+                    for _wi in (15, 16):
+                        _pw = _sp[_wi]
+                        if ((_hw.x - _pw.x)**2 + (_hw.y - _pw.y)**2) < 0.0144:
+                            _near_arm = True
+                            break
+                    if _near_arm:
+                        break
+                if not _near_arm:
+                    continue
+                lm_s, cn_s = (left_lm, left_cn) if handedness == "Left" else (right_lm, right_cn)
+                drawing_utils.draw_landmarks(
+                    image=panel4, landmark_list=hand_lms,
+                    connections=HandLandmarksConnections.HAND_CONNECTIONS,
+                    landmark_drawing_spec=lm_s, connection_drawing_spec=cn_s,
+                )
 
         # 多人脸框 + person 标签
         sf = panel_w / w
@@ -1969,6 +2021,10 @@ def main():
             _pil_p4_emotion_hint = f"Emotion: {dominant_emotion}"
 
         # ---- 认知与预判警报 ----
+        if primary_pose is not None:
+            pose_history.append(primary_pose)
+        else:
+            pose_history.clear()
         if len(pose_history) == 3:
             cognitive = analyze_cognitive_and_anticipation(pose_history, dominant_emotion)
             if cognitive is not None:
@@ -2425,12 +2481,6 @@ def main():
             multi_person_mode = not multi_person_mode
             print(f"Multi-person mode: {'ON' if multi_person_mode else 'OFF (single)'}")
 
-        # 存姿态历史 (仅 person 0)，用于时序动力学分析
-        if primary_pose is not None:
-            pose_history.append(primary_pose)
-        else:
-            pose_history.clear()
-
         # 定期清理过期的 smoother (每 150 帧 ≈ 5 秒)
         if frame_count % 150 == 0:
             current_pids = set(person_faces.keys()) | set(person_poses.keys())
@@ -2454,3 +2504,9 @@ if __name__ == "__main__":
         main()
     except KeyboardInterrupt:
         print("\nQuit")
+    except Exception as e:
+        print(f"\nCrash: {e}")
+        import traceback
+        traceback.print_exc()
+    finally:
+        cv2.destroyAllWindows()

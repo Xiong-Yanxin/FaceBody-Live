@@ -1,2 +1,11 @@
 opencv-python
 mediapipe
+numpy
+Pillow
+scipy
+onnx
+onnxruntime
+pyyaml
+# 可选依赖 (取消注释以启用对应功能):
+# python-osc       # OSC/VMC 协议输出 (VRchat/VSeeFace 面部捕捉)
+# pyvirtualcam     # 虚拟摄像头输出 (Zoom/OBS/腾讯会议)
