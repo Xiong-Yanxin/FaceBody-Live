@@ -55,7 +55,7 @@ class EMASmoother:
 
 
 def _get_or_create_smoother(pool, person_id, alpha, max_lost):
-    """按 person_id 获取或创建 EMA 平滑器"""
+    # 拿对应 person_id 的平滑器，没有就新建一个
     if person_id not in pool:
         pool[person_id] = EMASmoother(alpha=alpha, max_lost_frames=max_lost)
     return pool[person_id]
@@ -450,7 +450,86 @@ def _is_high_alert(text):
     return any(kw in text for kw in _HIGH_ALERT_KW)
 
 
-# cv2 BGR → PIL RGBA
+# 界面的颜色和尺寸，统一放这里改起来方便
+# 间距，按4的倍数来
+_SP2, _SP4, _SP8, _SP12, _SP16, _SP20, _SP24, _SP32 = 2, 4, 8, 12, 16, 20, 24, 32
+# 圆角大小
+_R_SM, _R_MD, _R_LG, _R_XL = 6, 10, 16, 24
+# 背景色 (RGBA)
+_SURF0 = (12, 14, 20, 255); _SURF1 = (18, 21, 30, 255)
+_SURF2 = (28, 32, 42, 255); _SURF3 = (38, 43, 56, 255)
+_GLASS_DARK = (16, 19, 28, 220); _GLASS_MID = (22, 26, 36, 200)
+# 几种常用高亮色
+_A_CYAN = (0, 210, 210); _A_MAGENTA = (210, 60, 210)
+_A_GREEN = (60, 210, 60); _A_ORANGE = (210, 140, 0)
+_A_LIME = (160, 240, 60); _A_RED = (240, 50, 50)
+# 文字颜色 (RGBA)
+_T1 = (235, 235, 245, 255); _T2 = (180, 185, 195, 255)
+_T3 = (120, 125, 140, 220); _T4 = (90, 90, 100, 180)
+# 字体大小
+_F_HERO, _F_TITLE, _F_BODY, _F_SMALL, _F_CAPTION = 22, 18, 16, 14, 12
+
+
+# 画界面的小组件
+def _glass_card(draw, x, y, w, h, radius=_R_MD, accent=None, alpha=160):
+    # 半透明圆角底 + 细白边框 + 可选顶部颜色条
+    base = _SURF2[:3] + (alpha,)
+    draw.rounded_rectangle([x, y, x+w, y+h], radius=radius, fill=base)
+    draw.rounded_rectangle([x, y, x+w, y+h], radius=radius,
+                           outline=(255, 255, 255, 18), width=1)
+    if accent:
+        draw.rounded_rectangle([x+_SP4, y+2, x+w-_SP4, y+4],
+                               radius=2, fill=accent + (220,))
+
+
+def _mode_pill(draw, x, y, label, accent, font):
+    # 圆角药丸形标签，带颜色背景和细边框
+    bb = draw.textbbox((0, 0), label, font=font)
+    tw, th = bb[2]-bb[0], bb[3]-bb[1]
+    r, g, b = accent
+    draw.rounded_rectangle([x, y, x+tw+_SP12*2, y+th+_SP4*2],
+                           radius=_R_SM, fill=(r//5, g//5, b//5, 160))
+    draw.rounded_rectangle([x, y, x+tw+_SP12*2, y+th+_SP4*2],
+                           radius=_R_SM, outline=accent + (220,), width=1)
+    draw.text((x+_SP12, y+_SP4-bb[1]), label, font=font, fill=accent + (255,))
+
+
+def _keycap(draw, x, y, key, label, accent, font):
+    # 模拟键盘按键的样子：字母在方块里，说明文字跟在后面
+    bb = draw.textbbox((0, 0), key, font=font)
+    kw, kh = bb[2]-bb[0], bb[3]-bb[1]
+    kw = max(kw, 14)
+    kpad_x, kpad_y = 6, 3  # 键帽内边距
+    box_w, box_h = kw + kpad_x*2, kh + kpad_y*2
+    # 键帽阴影
+    draw.rounded_rectangle([x, y+2, x+box_w, y+box_h+2],
+                           radius=4, fill=_SURF3)
+    # 键帽本体
+    draw.rounded_rectangle([x, y, x+box_w, y+box_h],
+                           radius=4, fill=_SURF2)
+    draw.rounded_rectangle([x, y, x+box_w, y+box_h],
+                           radius=4, outline=accent+(120,))
+    # 字母精确居中
+    tx = x + (box_w - kw) / 2 - bb[0]
+    ty = y + (box_h - kh) / 2 - bb[1]
+    draw.text((tx, ty), key, font=font, fill=accent+(255,))
+    # 描述文字在键帽后面
+    draw.text((x+box_w+_SP8, y+kpad_y), label, font=font, fill=_T3)
+
+
+def _sidebar_row(draw, x, y, w, label, value, dot_color, font_small=None, font_body=None):
+    # 侧边栏一条数据：小圆点 + 标签 + 数值靠右
+    fs = font_small or _get_cached_font(_F_SMALL)
+    fb = font_body or _get_cached_font(_F_BODY)
+    r, g, b = dot_color
+    draw.ellipse([x+2, y+3, x+10, y+11], fill=(r, g, b, 255))
+    draw.text((x+_SP16, y), label, font=fs, fill=_T2)
+    if value:
+        vb = draw.textbbox((0, 0), value, font=fb)
+        draw.text((x+w-vb[2]-_SP4, y-2), value, font=fb, fill=(r, g, b, 220))
+
+
+# OpenCV的BGR转成PIL的RGBA
 def _bgr_to_rgba(bgr, alpha=255):
     return (int(bgr[2]), int(bgr[1]), int(bgr[0]), alpha)
 
@@ -460,7 +539,7 @@ def draw_modern_hud_panel(draw, text, x, y, font,
                           bg_color=(30, 30, 30, 180),
                           radius=12, pad_x=15, pad_y=10,
                           accent_color=None, card_width=None):
-    """画一个圆角矩形 HUD 卡片，文字居中；可选 accent 装饰条；card_width 可统一宽度"""
+    # 画个圆角矩形卡片，文字居中，可选顶部颜色条，宽度可以统一
     bbox = draw.textbbox((0, 0), text, font=font)
     tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
     rw = max(tw + pad_x * 2, card_width) if card_width else tw + pad_x * 2
@@ -601,7 +680,7 @@ def draw_pil_text_card(draw, text, center_x, top_y, font,
 
 def draw_pil_emotion_bars(draw, x, y, w, bar_h, gap,
                           scores_array, label_order, font_small):
-    """画情绪置信度圆角条形图（渐变填充 + 百分比 + 描边）"""
+    # 画情绪置信度的圆角条形图，带渐变填充、百分比和描边
     for i, name in enumerate(label_order):
         val = float(scores_array[i]) if i < len(scores_array) else 0.0
         by_ = y + i * (bar_h + gap)
@@ -669,7 +748,8 @@ _T_Z_SPEED_IN = -0.05 # 手腕 Z 速度低于此 → 向镜头突进
 
 
 def analyze_cognitive_and_anticipation(pose_history, emotion):
-    """用3帧姿态历史做动力学分析，检出情绪失调和预判信号。返回 (警告文字, BGR颜色) 或 None"""
+    # 用最近3帧的姿态数据做运动分析，看看有没有情绪和行为不一致的地方
+# 有异常就返回 (警告文字, BGR颜色)，没有就返回 None
     if len(pose_history) != 3:
         return None
 
@@ -985,7 +1065,7 @@ def draw_pose_full(img, landmarks, w, h,
                    lm_color=(0, 255, 0), cn_color=(0, 0, 255),
                    thickness=2, circle_r=3, skip_face=False,
                    prev_landmarks=None, attention_mode=False):
-    """attention_mode 开启时，连线颜色/粗细按关节速度动态映射（蓝=静止, 红=快速）"""
+    """开了 attention 模式的话，连线颜色按关节运动速度来：蓝=没怎么动, 红=动得快"""
     _FACE_IDS = {0,1,2,3,4,5,6,7,8,9,10}
     connections = PoseLandmarksConnections.POSE_LANDMARKS
     pts = {}
@@ -1262,7 +1342,7 @@ def avg2(s, k1, k2):
 
 def _draw_sidebar_alert_block(pil_draw, text, font, max_px, sx, sw, sy,
                                 bg_fill, text_fill):
-    """侧边栏告警卡片: 返回更新后的 sy 坐标"""
+    # 在侧边栏画一个告警块，返回更新后的 y 坐标
     lines = _wrap_text_lines(pil_draw, text, font, max_px)
     lh = pil_draw.textbbox((0, 0), "Ag", font=font)[3]
     row_h = lh * len(lines) + 2 * (len(lines) - 1) + 10
@@ -1468,7 +1548,7 @@ def main():
     sidebar = canvas[0:panel_h*2, panel_w*2:panel_w*2+sidebar_w]  # 右侧栏
     pose_overlay = np.zeros((panel_h, panel_w, 3), dtype=np.uint8)
 
-    # DL 常驻消费者线程 + 队列
+    # DL 推理放后台线程跑，用队列传图，不卡主线程
     dl_queue = queue.Queue(maxsize=1)
     dl_thread_lock = threading.Lock()
 
@@ -1523,7 +1603,7 @@ def main():
             continue
         cam_fail = 0
 
-        # 线程安全：一次性拷贝 DL 共享状态，避免竞态条件
+        # 一口气把DL的结果拷出来，防止后台线程同时改数据导致错乱
         with dl_thread_lock:
             dl_emotion = dl_emotion_cached
             dl_scores = dl_scores_cached.copy() if dl_scores_cached is not None else None
@@ -2088,12 +2168,13 @@ def main():
         pil_canvas = Image.fromarray(cv2.cvtColor(canvas, cv2.COLOR_BGR2RGBA))
         pil_draw = ImageDraw.Draw(pil_canvas)
 
-        # 准备不同大小的字体
-        font_panel = _get_cached_font(17)
-        font_info = _get_cached_font(20)
-        font_small = _get_cached_font(16)
-        font_tiny = _get_cached_font(14)
-        font_emotion = _get_cached_font(18)
+        # 准备几档不同大小的字体
+        font_hero = _get_cached_font(_F_HERO)
+        font_panel = _get_cached_font(_F_TITLE)
+        font_info = _get_cached_font(_F_BODY)
+        font_small = _get_cached_font(_F_SMALL)
+        font_tiny = _get_cached_font(_F_CAPTION)
+        font_body = _get_cached_font(_F_BODY)
 
         # 面板边界，防止文字溢出
         _p2_bounds = (panel_w + 8, panel_w * 2 - 8)
@@ -2118,7 +2199,7 @@ def main():
                               bg_color=(80, 0, 0, 200) if scramble_mode else (30, 30, 30, 180),
                               accent_color=(200, 50, 50, 255) if scramble_mode else (0, 200, 200, 255),
                               card_width=_uniform_title_w)
-        # FPS 药丸徽章：颜色按帧率分档
+        # FPS 小标：颜色按帧率分档，绿=流畅，黄=一般，红=卡
         if fps >= 25:
             fps_color = (0, 180, 80)
         elif fps >= 15:
@@ -2148,16 +2229,11 @@ def main():
                               text_color=(200, 200, 200, 255), bg_color=(30, 30, 30, 180),
                               accent_color=(50, 200, 50, 255), card_width=_uniform_title_w)
 
-        # 面板4：标题左上角，BPM右上角
+        # 面板4：标题左上角
         draw_modern_hud_panel(pil_draw, "Combined", panel_w + 8, panel_h + 8,
                               font_panel, pad_x=14, pad_y=8, radius=10,
                               text_color=(200, 200, 200, 255), bg_color=(30, 30, 30, 180),
                               accent_color=(200, 150, 0, 255), card_width=_uniform_title_w)
-        if _pil_bpm_text is not None:
-            bpm_str, bpm_bgr = _pil_bpm_text
-            bpm_tw = pil_draw.textbbox((0, 0), bpm_str, font=font_info)[2]
-            pil_draw.text((panel_w * 2 - bpm_tw - 14, panel_h + 10),
-                          bpm_str, font=font_info, fill=(255, 20, 20, 255))
         if _pil_p3_attention:
             pil_draw.text((panel_w - 200, panel_h * 2 - 28),
                           "ST-GCN ATTENTION ON", font=font_tiny,
@@ -2168,7 +2244,7 @@ def main():
             lbl, scr, clr, fx, fy, fw, fh = _pil_p4_top_emotion
             # 情绪标签放人脸框右边，放不下就放下面
             label_text = f"{lbl} {scr:.0%}"
-            lbbox = pil_draw.textbbox((0, 0), label_text, font=font_emotion)
+            lbbox = pil_draw.textbbox((0, 0), label_text, font=font_panel)
             ltw = lbbox[2] - lbbox[0]
             if fx + fw + ltw + 16 < panel_w:
                 lx = fx + fw + 8
@@ -2185,7 +2261,7 @@ def main():
                 [lx_canvas - 4, ly_canvas - 2, lx_canvas + ltw + 4, ly_canvas + 24],
                 radius=6, fill=(clr[2] // 4, clr[1] // 4, clr[0] // 4, 180))
             pil_draw.text((lx_canvas, ly_canvas), label_text,
-                          font=font_emotion, fill=(clr[2], clr[1], clr[0], 255))
+                          font=font_panel, fill=(clr[2], clr[1], clr[0], 255))
 
             # 动作标签放情绪下面
             if _pil_p4_facial_actions:
@@ -2245,21 +2321,12 @@ def main():
                                radius=10, pad_x=12, pad_y=6,
                                bounds=_p4_bounds)
 
-        # 底部的状态标签，描边风格
-        mode_x = 12
-        for mode_name, mode_color in _pil_mode_list:
-            bbox = pil_draw.textbbox((0, 0), mode_name, font=font_tiny)
-            mw, mh = bbox[2] - bbox[0], bbox[3] - bbox[1]
-            r, g, b = mode_color[2], mode_color[1], mode_color[0]
-            pil_draw.rounded_rectangle(
-                [mode_x, panel_h * 2 - mh - 16, mode_x + mw + 18, panel_h * 2 - 8],
-                radius=6, fill=(r // 4, g // 4, b // 4, 140))
-            pil_draw.rounded_rectangle(
-                [mode_x, panel_h * 2 - mh - 16, mode_x + mw + 18, panel_h * 2 - 8],
-                radius=6, outline=(r, g, b, 220), width=1)
-            pil_draw.text((mode_x + 9, panel_h * 2 - mh - 14), mode_name,
-                          font=font_tiny, fill=(r, g, b, 255))
-            mode_x += mw + 28
+        # 底部模式状态标签
+        mode_x = _SP12
+        for mode_name, mode_color_bgr in _pil_mode_list:
+            r, g, b = mode_color_bgr[2], mode_color_bgr[1], mode_color_bgr[0]
+            _mode_pill(pil_draw, mode_x, panel_h*2 - 26, mode_name, (r, g, b), font_tiny)
+            mode_x += pil_draw.textbbox((0,0), mode_name, font=font_tiny)[2] + _SP12*3
 
         # 右侧栏：情绪监控面板
         sx = panel_w * 2
@@ -2279,12 +2346,19 @@ def main():
         sy = 52
 
         # 人数计数 + 模式标识
-        mode_label = "Multi" if multi_person_mode else "Single"
-        mode_color = (100, 255, 200) if multi_person_mode else (200, 200, 100)
-        mode_str = f"{mode_label}  |  People: {_pil_person_count}" if _pil_person_count > 0 else mode_label
+        mode_parts = ["Multi" if multi_person_mode else "Single"]
+        if scramble_mode:
+            mode_parts.append("SCRAMBLE")
+        if noise_mode:
+            mode_parts.append("NOISE")
+        if attention_mode:
+            mode_parts.append("ATTN")
+        mode_str = " | ".join(mode_parts)
+        if _pil_person_count > 0:
+            mode_str += f"  |  People: {_pil_person_count}"
         mode_tw = pil_draw.textbbox((0, 0), mode_str, font=font_tiny)[2]
         pil_draw.text((sx + (sw - mode_tw) // 2, 36), mode_str,
-                      font=font_tiny, fill=(mode_color[0], mode_color[1], mode_color[2], 220))
+                      font=font_tiny, fill=(220, 220, 220, 220))
 
         if _pil_p2_no_face or _pil_person_count == 0:
             pil_draw.text((sx + 14, sy + 20), "No person detected",
@@ -2339,6 +2413,29 @@ def main():
                 pil_draw.text((score_x, sy + 2), f"{p_sc:.0%}",
                               font=font_tiny, fill=(int(p_color[2]), int(p_color[1]), int(p_color[0]), 180))
                 sy += 26
+
+            # 意图显示（情绪+手势融合）
+            # 意图行：风格跟上面 DL/BS 一致
+            if _pil_notification is not None:
+                notif_text, is_alert = _pil_notification
+                short = notif_text.replace("意图: ", "")
+                ic = _A_RED if is_alert else _A_CYAN
+                r, g, b = ic
+                pil_draw.rounded_rectangle([sx + 10, sy, sx + sw - 10, sy + 28],
+                                            radius=6, fill=(r//4, g//4, b//4, 120))
+                pil_draw.ellipse([sx + 18, sy + 8, sx + 26, sy + 16],
+                                 fill=(r, g, b, 255))
+                pil_draw.text((sx + _SP32, sy + 4), f"Intent: {short[:24]}",
+                              font=font_small, fill=(r, g, b, 255))
+                sy += _SP32
+            else:
+                pil_draw.rounded_rectangle([sx + 10, sy, sx + sw - 10, sy + 28],
+                                            radius=6, fill=_SURF3)
+                pil_draw.ellipse([sx + 18, sy + 8, sx + 26, sy + 16],
+                                 fill=_T3)
+                pil_draw.text((sx + _SP32, sy + 4), "Intent: 无 / None",
+                              font=font_small, fill=_T3)
+                sy += _SP32
 
             # 每个人的身体状态
             _draw_section_divider(pil_draw, "── BODY ──", sy, font_tiny, sx, sw)
@@ -2413,15 +2510,6 @@ def main():
             sy = max(sy, panel_h * 2 - 200)
             has_cognitive = False
 
-            # 意图/手势
-            if _pil_notification is not None:
-                notif_text, is_alert = _pil_notification
-                short = notif_text.replace("意图: ", "").replace("[失调警报]", "[!]")
-                text_fill = (255, 80, 80, 255) if is_alert else (0, 220, 220, 255)
-                sy = _draw_sidebar_alert_block(pil_draw, short, font_tiny, _max_side_px,
-                                               sx, sw, sy, (30, 30, 40, 180), text_fill)
-                has_cognitive = True
-
             # 认知警报
             if _pil_cognitive_alert is not None:
                 c_alert, c_bg = _pil_cognitive_alert
@@ -2440,9 +2528,18 @@ def main():
                                                (255, 255, 255, 255))
                 has_cognitive = True
 
-            if not has_cognitive:
-                pil_draw.text((sx + 14, sy + 4), "Awaiting signal...",
-                              font=font_tiny, fill=(120, 120, 140, 180))
+        # 右侧栏底部的按键提示，竖着排列
+        help_items = [
+            ("E", "乱码 Scramble", (150, 150, 255)),
+            ("N", "噪声 Noise", (100, 200, 100)),
+            ("A", "注意力 Attention", (255, 200, 50)),
+            ("M", "多人 Multi-person", (100, 255, 200)),
+            ("Q", "退出 Exit", (255, 100, 100)),
+        ]
+        help_y = panel_h * 2 - 148
+        for key_txt, label_txt, clr in help_items:
+            _keycap(pil_draw, sx + _SP8, help_y, key_txt, label_txt, clr, font_tiny)
+            help_y += 22
 
         # 面板彩色边框
         _panel_borders = [
@@ -2470,16 +2567,12 @@ def main():
             break
         elif key == ord("e"):
             scramble_mode = not scramble_mode
-            print(f"Scramble mode: {'ON' if scramble_mode else 'OFF'}")
         elif key == ord("n"):
             noise_mode = not noise_mode
-            print(f"Noise mode: {'ON' if noise_mode else 'OFF'}")
         elif key == ord("a"):
             attention_mode = not attention_mode
-            print(f"Attention mode: {'ON' if attention_mode else 'OFF'}")
         elif key == ord("m"):
             multi_person_mode = not multi_person_mode
-            print(f"Multi-person mode: {'ON' if multi_person_mode else 'OFF (single)'}")
 
         # 定期清理过期的 smoother (每 150 帧 ≈ 5 秒)
         if frame_count % 150 == 0:
