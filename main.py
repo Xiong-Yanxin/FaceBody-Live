@@ -14,6 +14,7 @@ except ImportError:
     EmotiEffLibRecognizerOnnxGPU = None
 import time
 import os
+import sys
 import ctypes
 import numpy as np
 from math import atan2, degrees, sqrt
@@ -21,6 +22,9 @@ import threading
 from PIL import Image, ImageDraw, ImageFont
 import collections
 import queue
+import argparse
+import tkinter.filedialog as filedialog
+import tkinter as tk
 
 
 
@@ -513,8 +517,11 @@ def _keycap(draw, x, y, key, label, accent, font):
     tx = x + (box_w - kw) / 2 - bb[0]
     ty = y + (box_h - kh) / 2 - bb[1]
     draw.text((tx, ty), key, font=font, fill=accent+(255,))
-    # 描述文字在键帽后面
-    draw.text((x+box_w+_SP8, y+kpad_y), label, font=font, fill=_T3)
+    # 描述文字在键帽后面，跟键帽垂直居中对齐
+    _lbb = draw.textbbox((0, 0), label, font=font)
+    _lth = _lbb[3] - _lbb[1]
+    _lty = y + (box_h - _lth) / 2 - _lbb[1]
+    draw.text((x+box_w+_SP8, _lty), label, font=font, fill=_T3)
 
 
 def _sidebar_row(draw, x, y, w, label, value, dot_color, font_small=None, font_body=None):
@@ -1366,7 +1373,7 @@ def _draw_section_divider(draw, text, at_y, font, sx, sw):
 
 
 # ==================== 主程序 ====================
-def main():
+def main(input_video=None, output_video=None):
     # 模型路径
     models_dir = os.path.join(os.path.dirname(__file__), "models")
     mp_dir = os.path.join(models_dir, "mediapipe")
@@ -1463,24 +1470,37 @@ def main():
 
     # 打开摄像头
     cap = None
-    for idx in [1, 0]:
-        try:
-            cap_test = cv2.VideoCapture(idx, cv2.CAP_DSHOW)
-            if cap_test.isOpened():
-                cap_test.set(cv2.CAP_PROP_FRAME_WIDTH, 960)
-                cap_test.set(cv2.CAP_PROP_FRAME_HEIGHT, 540)
-                cam_w = int(cap_test.get(cv2.CAP_PROP_FRAME_WIDTH))
-                cam_h = int(cap_test.get(cv2.CAP_PROP_FRAME_HEIGHT))
-                print(f"Camera {idx}: {cam_w}x{cam_h}")
-                for _ in range(5):
-                    cap_test.read()  # 预热摄像头
-                _, test_frame = cap_test.read()
-                if test_frame is not None:
-                    cap = cap_test
-                    break
-            cap_test.release()
-        except Exception:
-            continue
+    is_video_file = input_video is not None
+    if is_video_file:
+        cap = cv2.VideoCapture(input_video)
+        if not cap.isOpened():
+            print(f"Error: cannot open video: {input_video}")
+            pose_landmarker.close(); gesture_recognizer.close(); face_landmarker.close()
+            return
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        cap_fps = cap.get(cv2.CAP_PROP_FPS)
+        if cap_fps <= 0:
+            cap_fps = 30
+        print(f"Input: {input_video} ({total_frames} frames, {cap_fps:.1f} fps)")
+    else:
+        for idx in [1, 0]:
+            try:
+                cap_test = cv2.VideoCapture(idx, cv2.CAP_DSHOW)
+                if cap_test.isOpened():
+                    cap_test.set(cv2.CAP_PROP_FRAME_WIDTH, 960)
+                    cap_test.set(cv2.CAP_PROP_FRAME_HEIGHT, 540)
+                    cam_w = int(cap_test.get(cv2.CAP_PROP_FRAME_WIDTH))
+                    cam_h = int(cap_test.get(cv2.CAP_PROP_FRAME_HEIGHT))
+                    print(f"Camera {idx}: {cam_w}x{cam_h}")
+                    for _ in range(5):
+                        cap_test.read()
+                    _, test_frame = cap_test.read()
+                    if test_frame is not None:
+                        cap = cap_test
+                        break
+                cap_test.release()
+            except Exception:
+                continue
 
     if cap is None:
         print("Error: no camera available.")
@@ -1514,6 +1534,8 @@ def main():
     dl_scores_ema = None
     dl_ema_alpha = 0.35
     dl_candidate_label = None      # 滞后候选标签
+    recording = False
+    rec_start_time = 0
     dl_candidate_streak = 0        # 候选连续帧数
     dl_hysteresis_frames = 2
 
@@ -1547,6 +1569,19 @@ def main():
     panel4 = canvas[panel_h:panel_h*2, panel_w:panel_w*2]       # 右下: 合成
     sidebar = canvas[0:panel_h*2, panel_w*2:panel_w*2+sidebar_w]  # 右侧栏
     pose_overlay = np.zeros((panel_h, panel_w, 3), dtype=np.uint8)
+
+    # 保存输出视频
+    video_writer = None
+    if output_video:
+        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+        out_w = panel_w * 2 + sidebar_w
+        out_h = panel_h * 2
+        video_writer = cv2.VideoWriter(output_video, fourcc, cap_fps if is_video_file else 25, (out_w, out_h))
+        if not video_writer.isOpened():
+            print(f"Error: cannot create output: {output_video}")
+            video_writer = None
+        else:
+            print(f"Output: {output_video}")
 
     # DL 推理放后台线程跑，用队列传图，不卡主线程
     dl_queue = queue.Queue(maxsize=1)
@@ -1619,7 +1654,13 @@ def main():
                 cv2.rectangle(frame, (rx, ry), (rx + rw, ry + rh), (0, 0, 0), -1)
 
         h, w = frame.shape[:2]
-        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        # 浅色衣服骨架难识别，先拉一下画面对比度
+        frame_lab = cv2.cvtColor(frame, cv2.COLOR_BGR2LAB)
+        l, a, b = cv2.split(frame_lab)
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+        l_eq = clahe.apply(l)
+        frame_enhanced = cv2.cvtColor(cv2.merge([l_eq, a, b]), cv2.COLOR_LAB2BGR)
+        frame_rgb = cv2.cvtColor(frame_enhanced, cv2.COLOR_BGR2RGB)
         mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=frame_rgb)
 
         # 异步推给 MediaPipe
@@ -2053,7 +2094,19 @@ def main():
             sm_face = smoothed_faces.get(pid)
             if sm_face is None:
                 continue
-            fx_f, fy_f, fw_f, fh_f = get_face_bbox(sm_face, w, h, margin=0)
+            # 用没平滑过的原始点来算框，裁掉边上3%，框更贴合脸
+            _raw_face = person_faces[pid][0]
+            _fxs = sorted([lm.x for lm in _raw_face])
+            _fys = sorted([lm.y for lm in _raw_face])
+            # 裁边上3%收紧
+            _n = len(_fxs)
+            _trim = max(1, int(_n * 0.03))
+            _fx_min, _fx_max = _fxs[_trim], _fxs[-_trim-1]
+            _fy_min, _fy_max = _fys[_trim], _fys[-_trim-1]
+            fx_f = int(_fx_min * w)
+            fy_f = int(_fy_min * h)
+            fw_f = int((_fx_max - _fx_min) * w)
+            fh_f = int((_fy_max - _fy_min) * h)
             fxp = int(fx_f * sf)
             fyp = int(fy_f * sf)
             fwp = int(fw_f * sf)
@@ -2083,10 +2136,19 @@ def main():
             em_label, em_score, _ = person_emotions[pid]
             sm_face = smoothed_faces.get(pid)
             if sm_face:
-                fx_f, fy_f, fw_f, fh_f = get_face_bbox(sm_face, w, h, margin=0)
+                _raw_f = person_faces[pid][0]
+                _fxs2 = sorted([lm.x for lm in _raw_f])
+                _fys2 = sorted([lm.y for lm in _raw_f])
+                _n2 = len(_fxs2)
+                _t2 = max(1, int(_n2 * 0.03))
+                fx_f = int(_fxs2[_t2] * w)
+                fy_f = int(_fys2[_t2] * h)
+                fw_f = int((_fxs2[-_t2-1] - _fxs2[_t2]) * w)
+                fh_f = int((_fys2[-_t2-1] - _fys2[_t2]) * h)
                 fxp_s = int(fx_f * sf)
                 fyp_s = int(fy_f * sf)
                 fwp_s = int(fw_f * sf)
+                fhp_s = int(fh_f * sf)
                 color = _PERSON_COLORS_BGR[pid % len(_PERSON_COLORS_BGR)]
                 _pil_p4_face_bboxes.append((pid, fxp_s, fyp_s + fhp_s + 4,
                                             em_label, em_score, color))
@@ -2534,9 +2596,11 @@ def main():
             ("N", "噪声 Noise", (100, 200, 100)),
             ("A", "注意力 Attention", (255, 200, 50)),
             ("M", "多人 Multi-person", (100, 255, 200)),
+            ("V", "上传视频 Video", (100, 200, 255)),
+            ("R", "结束录制 Stop" if recording else "录制 Record", (255, 60, 60)),
             ("Q", "退出 Exit", (255, 100, 100)),
         ]
-        help_y = panel_h * 2 - 148
+        help_y = panel_h * 2 - 184
         for key_txt, label_txt, clr in help_items:
             _keycap(pil_draw, sx + _SP8, help_y, key_txt, label_txt, clr, font_tiny)
             help_y += 22
@@ -2558,7 +2622,33 @@ def main():
         # RGBA转回BGR给OpenCV显示，用asarray共享内存不拷贝
         canvas = cv2.cvtColor(np.asarray(pil_canvas), cv2.COLOR_RGBA2BGR)
 
+# 录制指示器
+        if recording:
+            import time as _tm2
+            dur = int(_tm2.time() - rec_start_time)
+            mins, secs = dur // 60, dur % 60
+            dur_str = f"{mins:02d}:{secs:02d}"
+            # 红色圆点
+            px, py = panel_w * 2 - 60, 44
+            cv2.circle(canvas, (px, py), 8, (0, 0, 255), -1)
+            cv2.circle(canvas, (px, py), 8, (255, 255, 255), 1)
+            # 录制文字
+            cv2.putText(canvas, f"REC {dur_str}", (px - 60, py - 18),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
+            cv2.putText(canvas, f"REC {dur_str}", (px - 60, py - 18),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+
+        if recording and video_writer and video_writer.isOpened():
+            video_writer.write(canvas)
+
         cv2.imshow("MediaPipe - Pose + Hands + Face - Press 'q' to exit", canvas)
+
+        # 视频模式进度
+        if is_video_file and total_frames > 0:
+            pos = int(cap.get(cv2.CAP_PROP_POS_FRAMES))
+            if pos % 30 == 0:
+                pct = pos / total_frames * 100
+                print(f"\r  Progress: {pos}/{total_frames} ({pct:.0f}%)", end="")
 
         # 键盘：退出 + 模式切换
         key = cv2.waitKey(1) & 0xFF
@@ -2573,6 +2663,43 @@ def main():
             attention_mode = not attention_mode
         elif key == ord("m"):
             multi_person_mode = not multi_person_mode
+        elif key == ord("r"):
+            # 切换录制
+            if not recording:
+                import time as _tm
+                rec_start_time = _tm.time()
+                fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+                out_w = panel_w * 2 + sidebar_w
+                out_h = panel_h * 2
+                rec_fps = cap_fps if is_video_file else 25
+                _root_dir = os.path.dirname(os.path.abspath(__file__))
+                rec_path = os.path.join(_root_dir, f"recording_{_tm.strftime('%Y%m%d_%H%M%S')}.mp4")
+                video_writer = cv2.VideoWriter(rec_path, fourcc, rec_fps, (out_w, out_h))
+                if video_writer.isOpened():
+                    recording = True
+                    print(f"[REC] Started -> {rec_path}")
+            else:
+                recording = False
+                if video_writer:
+                    video_writer.release()
+                    video_writer = None
+                    print("[REC] Stopped")
+        elif key == ord("v"):
+            root=tk.Tk();root.withdraw();root.attributes("-topmost",True)
+            path=filedialog.askopenfilename(title="选择视频",filetypes=[("视频","*.mp4 *.avi *.mov *.mkv"),("所有","*.*")])
+            root.destroy()
+            if path:
+                
+                base=os.path.splitext(path)[0]
+                print(f"[Video] {path}")
+                is_video_file=True
+                if cap:cap.release()
+                cap=cv2.VideoCapture(path)
+                if cap.isOpened():
+                    total_frames=int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+                    cap_fps=cap.get(cv2.CAP_PROP_FPS) or 30
+                    print(f"[Video] {total_frames} frames, {cap_fps:.1f} fps")
+                    print(f"[Video] Press R to start/stop recording")
 
         # 定期清理过期的 smoother (每 150 帧 ≈ 5 秒)
         if frame_count % 150 == 0:
@@ -2585,7 +2712,9 @@ def main():
                     del face_smoothers[pid]
 
     # 清理资源
-    cap.release()
+    if video_writer:
+        video_writer.release()
+        print("[Video] Output saved")
     cv2.destroyAllWindows()
     pose_landmarker.close()
     gesture_recognizer.close()
